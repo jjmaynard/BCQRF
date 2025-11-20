@@ -1,0 +1,889 @@
+---
+title: "Metalog Functions"
+output: html_notebook
+---
+
+
+```{r}
+library(stats)
+
+# Normalize y to range (0, 1)
+normalize <- function(y) {
+  (y - min(y)) / (max(y) - min(y))
+}
+
+# Define the basis functions for the metalog
+metalog_basis <- function(y, n) {
+  switch(as.character(n),
+         '1' = log(y),
+         '2' = log(1 - y),
+         '3' = y * (1 - y) * log(y),
+         '4' = y * (1 - y) * log(1 - y),
+         '5' = y * (1 - y) * (log(y))^2,
+         '6' = y * (1 - y) * (log(1 - y))^2,
+         stop("Term not defined")
+  )
+}
+
+# Function to fit metalog to quantile data
+fit_metalog <- function(p, y) {
+  # Validate inputs
+  if (length(p) != length(y)) {
+    stop("Lengths of p and y must be equal")
+  }
+  
+  # Check if y is normalized, and normalize if not
+  if (any(y <= 0 | y >= 1)) {
+    y <- normalize(y)
+    message("Input y was not normalized. It has been normalized for metalog fitting.")
+  }
+  
+  # Create a matrix for the metalog basis functions
+  n_terms <- 6
+  m <- matrix(0, nrow = length(y), ncol = n_terms)
+  
+  for (i in 1:n_terms) {
+    m[, i] <- sapply(y, metalog_basis, n = i)
+  }
+  
+  # Linear regression to determine coefficients
+  fit <- lm(y ~ m - 1) # -1 removes the intercept term
+  return(fit$coefficients)
+}
+
+# Function to denormalize y values back to the original scale
+denormalize <- function(y_normalized, y_original) {
+  min_y <- min(y_original)
+  max_y <- max(y_original)
+  y_normalized * (max_y - min_y) + min_y
+}
+
+# Recreate the distribution using metalog coefficients
+recreate_metalog <- function(p, coefficients, y_original) {
+  n_terms <- length(coefficients)
+  y_recreated_normalized <- numeric(length(p))
+  
+  for (i in 1:n_terms) {
+    basis_values <- switch(as.character(i),
+                           '1' = log(p),
+                           '2' = log(1 - p),
+                           '3' = p * (1 - p) * log(p),
+                           '4' = p * (1 - p) * log(1 - p),
+                           '5' = p * (1 - p) * (log(p))^2,
+                           '6' = p * (1 - p) * (log(1 - p))^2)
+    y_recreated_normalized <- y_recreated_normalized + coefficients[i] * basis_values
+  }
+  
+  # Denormalize the recreated values back to the original scale of y
+  y_recreated <- denormalize(y_recreated_normalized, y_original)
+  return(y_recreated)
+}
+
+# Provide the quantile data
+p <- c(0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90)
+y <- c(3, 4, 5, 9, 11, 12, 15, 22, 23)
+
+# Fit the metalog
+coefficients <- fit_metalog(p, y)
+
+# Recreate the distribution with denormalization
+p_dense <- seq(0.01, 0.99, length.out = 100) # Dense quantile probabilities for smooth curve
+y_recreated <- recreate_metalog(p_dense, coefficients, y)
+
+# Plot the original empirical distribution
+plot(p, y, type = "o", col = "blue", pch = 16, lwd = 2,
+     xlab = "Quantile Probability (p)", ylab = "Quantile Value (y)",
+     main = "Empirical vs Metalog Recreated Distribution")
+points(p_dense, y_recreated, type = "l", col = "red", lwd = 2)
+
+# Add legend
+legend("topleft", legend = c("Empirical Distribution", "Metalog Recreated"),
+       col = c("blue", "red"), lty = 1, lwd = 2, pch = c(16, NA))
+
+
+```
+
+```{r}
+# Install and load the rmetalog package
+# install.packages("rmetalog") # Uncomment if not already installed
+library(rmetalog)
+
+# Define quantile probabilities and corresponding values
+p <- c(0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90)
+y <- c(3, 4, 5, 9, 11, 12, 15, 22, 23)
+
+# Fit the metalog distribution
+ml <- metalog(y, p = p, term_limit = 9, bounds = c(1, 25), boundedness='b', step_len = 0.01)
+
+# Generate values from the metalog distribution
+p_dense <- seq(0.01, 0.99, length.out = 100) # Dense probabilities for smooth curve
+y_recreated <- qmetalog(ml,p_dense, term = 9)
+
+# Plot the original empirical distribution
+plot(p, y, type = "o", col = "blue", pch = 16, lwd = 2,
+     xlab = "Quantile Probability (p)", ylab = "Quantile Value (y)",
+     main = "Empirical vs Metalog Recreated Distribution")
+lines(p_dense, y_recreated, col = "red", lwd = 2)
+
+# Add legend
+legend("topleft", legend = c("Empirical Distribution", "Metalog Recreated"),
+       col = c("blue", "red"), lty = 1, lwd = 2, pch = c(16, NA))
+
+```
+
+```{r}
+# Install and load the rmetalog package
+# install.packages("rmetalog") # Uncomment if not already installed
+library(rmetalog)
+
+# Define quantile probabilities and corresponding values
+p <- c(0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90)
+y <- c(3, 4, 5, 9, 11, 12, 15, 22, 23)
+
+# Fit the metalog distribution
+ml1 <- metalog(y, p = p, term_limit = 6, bounds = c(1, 25), boundedness='b', step_len = 0.01)
+ml2 <- metalog(y, p = p, term_limit = 6, bounds = c(0, 25), step_len = 0.01)
+
+# Extract the coefficients
+coefficients1 <- ml1$A[, 6] # Coefficients for the 6-term metalog distribution
+coefficients2 <- ml2$A[, 6]
+# Define a function to recreate the metalog distribution using coefficients
+metalog_function <- function(p, coefficients) {
+  n <- length(coefficients)
+  result <- 0
+  
+  # Loop over terms to calculate the metalog series
+  for (i in 1:n) {
+    term <- switch(i,
+                   '1' = log(p),
+                   '2' = log(1 - p),
+                   '3' = p * (1 - p) * log(p),
+                   '4' = p * (1 - p) * log(1 - p),
+                   '5' = p * (1 - p) * (log(p))^2,
+                   '6' = p * (1 - p) * (log(1 - p))^2,
+                   stop("Term not defined"))
+    result <- result + coefficients[i] * term
+  }
+  
+  return(result)
+}
+
+# Generate quantile values using the recreated metalog function
+p_dense <- seq(0.01, 0.99, length.out = 100)
+y_recreated1 <- metalog_function(p_dense, coefficients1)
+y_recreated2 <- metalog_function(p_dense, coefficients2)
+# Plot the original empirical distribution
+plot(p, y, type = "o", col = "blue", pch = 16, lwd = 2,
+     xlab = "Quantile Probability (p)", ylab = "Quantile Value (y)",
+     main = "Empirical vs Recreated Metalog Distribution (Using Coefficients)")
+lines(p_dense, y_recreated2, col = "red", lwd = 2)
+
+# Add legend
+legend("topleft", legend = c("Empirical Distribution", "Recreated Metalog"),
+       col = c("blue", "red"), lty = 1, lwd = 2, pch = c(16, NA))
+
+```
+
+```{r}
+# Install and load the rmetalog package
+# install.packages("rmetalog") # Uncomment if not already installed
+library(rmetalog)
+
+# Define quantile probabilities and corresponding values
+p <- c(0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90)
+y <- c(3, 4, 5, 9, 11, 12, 15, 22, 23)
+
+# Fit the metalog distribution
+ml <- metalog(y, p = p, term_limit = 6, bounds = c(0, NA), step_len = 0.01)
+
+# Generate quantile values using qmetalog
+p_dense <- seq(0.01, 0.99, length.out = 100) # Dense probabilities for smooth curve
+y_recreated <- qmetalog(ml, p_dense,  term = 6) # Generate quantiles for the 6-term metalog
+
+# Plot the original empirical distribution
+plot(p, y, type = "o", col = "blue", pch = 16, lwd = 2,
+     xlab = "Quantile Probability (p)", ylab = "Quantile Value (y)",
+     main = "Empirical vs Recreated Metalog Distribution (Using rmetalog)")
+lines(p_dense, y_recreated, col = "red", lwd = 2)
+
+# Add legend
+legend("topleft", legend = c("Empirical Distribution", "Recreated Metalog"),
+       col = c("blue", "red"), lty = 1, lwd = 2, pch = c(16, NA))
+
+```
+
+```{r}
+# Function to manually recreate the metalog distribution
+manual_qmetalog <- function(coefficients, y, term, boundedness = "u", bounds = c(NA, NA)) {
+  # Input validation
+  if (max(y) >= 1 | min(y) <= 0) {
+    stop("Error: y must be a positive numeric vector between 0 and 1")
+  }
+  if (term < 2 | term%%1 != 0 | length(term) > 1) {
+    stop("Error: term must be a single positive integer >= 2")
+  }
+  
+  # Initialize the basis functions
+  Y <- data.frame(y1 = rep(1, length(y)))         # y1 = constant 1
+  Y$y2 <- log(y / (1 - y))                       # y2 = log(y / (1 - y))
+  
+  if (term > 2) {
+    Y$y3 <- (y - 0.5) * Y$y2                     # y3 = (y - 0.5) * y2
+  }
+  if (term > 3) {
+    Y$y4 <- (y - 0.5)                            # y4 = (y - 0.5)
+  }
+  if (term > 4) {
+    for (i in 5:term) {
+      y_col <- paste0("y", i)
+      if (i %% 2 != 0) {  # Odd terms
+        Y[[y_col]] <- Y$y4^(i %/% 2)
+      } else {            # Even terms
+        z_col <- paste0("y", i - 1)
+        Y[[y_col]] <- Y$y2 * Y[[z_col]]
+      }
+    }
+  }
+  
+  # Convert to matrix
+  Y <- as.matrix(Y)
+  
+  # Apply the coefficients
+  s <- Y %*% coefficients[1:term]
+  
+  # Handle boundedness
+  if (boundedness == "sl") {
+    s <- bounds[1] + exp(s)
+  } else if (boundedness == "su") {
+    s <- bounds[2] - exp(-s)
+  } else if (boundedness == "b") {
+    s <- (bounds[1] + (bounds[2] * exp(s))) / (1 + exp(s))
+  }
+  
+  return(as.numeric(s))
+}
+
+# Example usage:
+
+# Install and load the rmetalog package
+# install.packages("rmetalog") # Uncomment if not already installed
+library(rmetalog)
+
+# Define quantile probabilities and corresponding values
+p <- c(0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90)
+y <- c(3, 4, 5, 9, 11, 12, 15, 22, 23)
+
+# Fit the metalog distribution
+ml1 <- metalog(y, p = p, term_limit = 6, bounds = c(1, 30), boundedness='b', step_len = 0.01)
+ml2 <- metalog(y, p = p, term_limit = 6, bounds = c(0, NA), step_len = 0.01)
+
+# Extract the coefficients
+coefficients1 <- ml1$A[, 6] # Coefficients for the 6-term metalog distribution
+coefficients2 <- ml2$A[, 6]
+
+# Manually recreate the distribution
+p_dense <- seq(0.01, 0.99, length.out = 100)
+y_recreated1 <- manual_qmetalog(coefficients1, p_dense, term = 6, boundedness = ml1$params$boundedness, bounds = ml1$params$bounds)
+y_recreated2 <- manual_qmetalog(coefficients2, p_dense, term = 6, boundedness = ml2$params$boundedness, bounds = ml2$params$bounds)
+
+# Plot the original empirical distribution
+plot(p, y, type = "o", col = "blue", pch = 16, lwd = 2,
+     xlab = "Quantile Probability (p)", ylab = "Quantile Value (y)",
+     main = "Empirical vs Recreated Metalog Distribution (Manual)")
+lines(p_dense, y_recreated1, col = "red", lwd = 2)
+
+# Add legend
+legend("topleft", legend = c("Empirical Distribution", "Recreated Metalog (Manual)"),
+       col = c("blue", "red"), lty = 1, lwd = 2, pch = c(16, NA))
+
+plot(p, y, type = "o", col = "blue", pch = 16, lwd = 2,
+     xlab = "Quantile Probability (p)", ylab = "Quantile Value (y)",
+     main = "Empirical vs Recreated Metalog Distribution (Manual)")
+lines(p_dense, y_recreated2, col = "red", lwd = 2)
+
+# Add legend
+legend("topleft", legend = c("Empirical Distribution", "Recreated Metalog (Manual)"),
+       col = c("blue", "red"), lty = 1, lwd = 2, pch = c(16, NA))
+```
+
+```{r}
+# Helper function: Newton's method to find probability for given quantile
+newtons_method <- function(coefficients, q, term, bounds, boundedness) {
+  alpha_step <- 0.01
+  err <- 1e-07
+  temp_err <- 0.1
+  y_now <- 0.5
+  i <- 1
+  while (temp_err > err) {
+    # Quantile function
+    quantile_val <- quantile_metalog(coefficients, y_now, term, bounds, boundedness)
+    
+    # PDF (density function)
+    density_val <- pdf_metalog(coefficients, y_now, term, bounds, boundedness)
+    
+    # Newton's method iteration
+    frist_function <- quantile_val - q
+    derv_function <- density_val
+    y_next <- y_now - alpha_step * (frist_function * derv_function)
+    temp_err <- abs(y_next - y_now)
+    
+    # Ensure y stays within valid bounds
+    y_next <- max(min(y_next, 0.99999), 1e-06)
+    y_now <- y_next
+    
+    # Stop if iteration limit is reached
+    i <- i + 1
+    if (i > 10000) {
+      stop(paste0("Approximation taking too long for quantile value: ", q, 
+                  ". Check distribution bounds or input parameters."))
+    }
+  }
+  return(y_now)
+}
+
+# newtons_method <- function (coefficients, q, term, bounds, boundedness) 
+# {
+#     alpha_step <- 0.01
+#     err <- 1e-07
+#     temp_err <- 0.1
+#     y_now <- 0.5
+#     a <- coefficients
+#     i <- 1
+#     while (temp_err > err) {
+#         frist_function <- (quantile_metalog(a, y_now, term, bounds, 
+#             boundedness) - q)
+#         derv_function <- pdf_metalog(a, y_now, term, bounds, 
+#             boundedness)
+#         y_next <- y_now - alpha_step * (frist_function * derv_function)
+#         temp_err <- abs((y_next - y_now))
+#         if (y_next > 1) {
+#             y_next <- 0.99999
+#         }
+#         if (y_next < 0) {
+#             y_next <- 1e-06
+#         }
+#         y_now <- y_next
+#         i <- i + 1
+#         if (i > 10000) {
+#             stop(paste0("Approximation taking too long, quantile value: ", 
+#                 q, " is to far from distribution median. Try plot() to see distribution."))
+#         }
+#     }
+#     return(y_now)
+# }
+
+
+# Helper function: Quantile function
+quantile_metalog <- function(a, y, term, bounds, boundedness) {
+  f <- (y - 0.5)
+  l <- log(y / (1 - y))
+  x <- a[1] + a[2] * l + a[3] * f * l
+  if (term > 3) {
+    x <- x + a[4] * f
+  }
+  o <- 2
+  e <- 2
+  if (term > 4) {
+    for (i in 5:term) {
+      if (i %% 2 == 0) {
+        x <- x + a[i] * f^e * l
+        e <- e + 1
+      }
+      if (i %% 2 != 0) {
+        x <- x + a[i] * f^o
+        o <- o + 1
+      }
+    }
+  }
+  if (boundedness == "sl") {
+    x <- bounds[1] + exp(x)
+  }
+  if (boundedness == "su") {
+    x <- bounds[2] - exp(-x)
+  }
+  if (boundedness == "b") {
+    x <- (bounds[1] + bounds[2] * exp(x)) / (1 + exp(x))
+  }
+  return(x)
+}
+
+# Helper function: PDF (density function)
+pdf_metalog <- function(a, y, term, bounds, boundedness) {
+  d <- y * (1 - y)
+  f <- (y - 0.5)
+  l <- log(y / (1 - y))
+  x <- a[2] / d
+  if (a[3] != 0) {
+    x <- x + a[3] * ((f / d) + l)
+  }
+  if (term > 3) {
+    x <- x + a[4]
+  }
+  e <- 1
+  o <- 1
+  if (term > 4) {
+    for (i in 5:term) {
+      if (i %% 2 != 0) {
+        x <- x + ((o + 1) * a[i] * f^o)
+        o <- o + 1
+      }
+      if (i %% 2 == 0) {
+        x <- x + a[i] * (((f^(e + 1)) / d) + (e + 1) * (f^e) * l)
+        e <- e + 1
+      }
+    }
+  }
+  x <- (x^(-1))
+  if (boundedness != "u") {
+    M <- quantile_metalog(a, y, term, bounds = bounds, boundedness = "u")
+  }
+  if (boundedness == "sl") {
+    x <- x * exp(-M)
+  }
+  if (boundedness == "su") {
+    x <- x * exp(M)
+  }
+  if (boundedness == "b") {
+    x <- (x * (1 + exp(M))^2) / ((bounds[2] - bounds[1]) * exp(M))
+  }
+  return(x)
+}
+
+pdf_Metalog_density <- function(coefficients, term, bounds, boundedness, y) {
+  a <- coefficients
+  d <- y * (1 - y)
+  f <- (y - 0.5)
+  l <- log(y/(1 - y))
+  x <- (a[2]/d)
+  if (a[3] != 0) {
+    x <- x + a[3] * ((f/d) + l)
+  }
+  if (term > 3) {
+    x <- x + a[4]
+  }
+  e <- 1
+  o <- 1
+  if (term > 4) {
+    for (i in 5:term) {
+      if (i%%2 != 0) {
+        x <- x + ((o + 1) * a[i] * f^o)
+        o <- o + 1
+      }
+      if (i%%2 == 0) {
+        x <- x + a[i] * (((f^(e + 1))/d) + (e + 1) * 
+                           (f^e) * l)
+        e <- e + 1
+      }
+    }
+  }
+  x <- (x^(-1))
+  if (boundedness != "u") {
+    M <- quantile_metalog(a, y, term, bounds = bounds, boundedness = "u")
+  }
+  if (boundedness == "sl") {
+    x <- x * exp(-M)
+  }
+  if (boundedness == "su") {
+    x <- x * exp(M)
+  }
+  if (boundedness == "b") {
+    x <- (x * (1 + exp(M))^2)/((bounds[2] - bounds[1]) * 
+                                 exp(M))
+  }
+  return(x)
+}
+
+
+dmetalog_manual <- function(coefficients, q, term = 3, bounds = c(NA, NA), boundedness = "u") {
+
+  # Compute probabilities (y) for each quantile using Newton's method
+  probabilities <- sapply(q, newtons_method, coefficients = coefficients, term = term, bounds = bounds, boundedness = boundedness)
+  # Compute the density (PDF) for each probability
+  densities <- sapply(probabilities, pdf_Metalog_density, coefficients = coefficients, term = term, bounds = bounds, boundedness = boundedness)
+  return(densities)
+}
+
+# Example Usage
+library(rmetalog)
+p <- c(0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90)
+y <- c(3, 4, 5, 9, 11, 12, 15, 22, 23)
+ml <- rmetalog::metalog(y, p = p, term_limit = 6, bounds = c(1, 25), step_len = 0.01, boundedness = 'b')
+
+# Extract coefficients
+coefficients <- ml$A[, 6][ml$A[, 6]!=0]
+
+# Quantiles to evaluate
+quantiles <- seq(3, 23, length.out = 100)
+
+# Compute the PDF manually
+pdf_values <- dmetalog_manual(coefficients, q = quantiles, term = 6, bounds = c(1, 25), boundedness = 'b')
+s <- dmetalog(ml, quantiles, term = 3)
+# Plot the PDF
+plot(quantiles, pdf_values, type = "l", col = "red", lwd = 2,
+     xlab = "Quantile Value (y)", ylab = "Density",
+     main = "Probability Density Function (PDF) - Manual Metalog")
+
+```
+
+
+```{r}
+# Given statistics
+summary_stats <- data.frame(
+  Percentile = c(0, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.0),
+  Value = c(1, 3, 4, 5, 9, 11, 12, 15, 22, 23, 25)  # Min, P10, Median, P90, Max
+)
+summary_stats <- data.frame(
+  Percentile = c(0, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.0),
+  Value = c(5, 6.4, 10.5, 16, 20.15, 30, 33.79, 46.92, 55.8, 77.91, 79.85)  # Values for Min, P10-P90, Max
+)
+# Create an interpolated empirical CDF
+x_vals <- seq(1, 25, length.out = 1000)  # Range of values
+empirical_cdf <- approxfun(summary_stats$Value, summary_stats$Percentile / 100, method = "linear")
+
+# Generate random samples from the empirical distribution
+set.seed(123)
+random_probs <- runif(1000)  # Generate random probabilities
+samples_empirical <- approx(x = summary_stats$Percentile / 100, y = summary_stats$Value, xout = random_probs)$y
+
+# Plot the recreated distribution
+hist(samples_empirical, breaks = 30, probability = TRUE, main = "Empirical Distribution",
+     xlab = "Value", ylab = "Density", col = "lightgreen")
+
+
+
+
+# Define the quantile function using linear interpolation
+empirical_quantile_function <- function(p, percentiles, values) {
+  approx(x = percentiles, y = values, xout = p)$y
+}
+
+# Generate random samples from the empirical distribution
+simulate_from_empirical <- function(n, percentiles, values) {
+  # Generate random probabilities
+  random_p <- runif(n)
+  
+  # Use the empirical quantile function to get values corresponding to these probabilities
+  sapply(random_p, function(p) empirical_quantile_function(p, percentiles, values))
+}
+
+# Define the percentiles and their corresponding values
+percentiles <- c(0, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1)
+values <- c(min_value, P10_value, P20_value, P30_value, P40_value, P50_value, P60_value, P70_value, P80_value, P90_value, max_value)
+
+# Simulate 1000 samples from the empirical distribution
+samples <- simulate_from_empirical(10000, Percentile, Value)
+
+# You can replace min_value, P10_value, ..., max_value with the actual values you have for those percentiles.
+
+
+
+```
+
+
+
+
+
+
+
+```{r}
+stat_PLVR1 <- read.csv('C:/R_Drive/Data_Files/LPKS_Data/Data/Global_Soil_Maps/wise_30sec_v1/Interchangeable_format/stat_PLVR1.txt')
+stat_KSPH1 <- read.csv('C:/R_Drive/Data_Files/LPKS_Data/Data/Global_Soil_Maps/wise_30sec_v1/Interchangeable_format/stat_KSPH1.txt')
+stat_CMHS1 <- read.csv('C:/R_Drive/Data_Files/LPKS_Data/Data/Global_Soil_Maps/wise_30sec_v1/Interchangeable_format/stat_CMHS1.txt')
+stat_ACCL1 <- read.csv('C:/R_Drive/Data_Files/LPKS_Data/Data/Global_Soil_Maps/wise_30sec_v1/Interchangeable_format/stat_ACCL1.txt')
+
+# Merge the two data frames by Cluster_ID
+wise_stats <- rbind(stat_PLVR1, stat_KSPH1, stat_CMHS1, stat_ACCL1)
+
+dist_list <- estimate_empirical_distribution(head(wise_stats))
+# For example, to sample from the first distribution:
+samples_row1 <- dist_list[[1]]$r(1000)
+mean(samples_row1)
+quantile(samples_row1, probs = c(0.1, 0.5, 0.9))
+
+```
+# Functions from the rmetalog package
+```{r}
+rmetalog:::dmetalog.metalog
+function (m, q, term = 3) 
+{
+    valid_terms <- m$Validation$term
+    if (class(q) != "numeric") {
+        stop("Error: q must be a numeric vector")
+    }
+    if (class(term) != "numeric" | term < 2 | term%%1 != 0 | 
+        !(term %in% valid_terms) | length(term) > 1) {
+        stop(paste("Error: term must be a single positive numeric interger contained", 
+            "in the metalog object. Available terms are:", valid_terms))
+    }
+    qs <- sapply(q, newtons_method_metalog, m = m, term = term)
+    ds <- sapply(qs, pdfMetalog_density, m = m, t = term)
+    return(ds)
+}
+
+rmetalog:::newtons_method_metalog
+function (m, q, term) 
+{
+    alpha_step <- 0.01
+    err <- 1e-07
+    temp_err <- 0.1
+    y_now <- 0.5
+    avec <- paste0("a", term)
+    a <- m$A[, avec]
+    i <- 1
+    while (temp_err > err) {
+        frist_function <- (rmetalog:::quantileMetalog(a, y_now, term, m$params$bounds, 
+            m$params$boundedness) - q)
+        derv_function <- rmetalog:::pdfMetalog(a, y_now, term, m$params$bounds, 
+            m$params$boundedness)
+        y_next <- y_now - alpha_step * (frist_function * derv_function)
+        temp_err <- abs((y_next - y_now))
+        if (y_next > 1) {
+            y_next <- 0.99999
+        }
+        if (y_next < 0) {
+            y_next <- 1e-06
+        }
+        y_now <- y_next
+        i <- i + 1
+        if (i > 10000) {
+            stop(paste0("Approximation taking too long, quantile value: ", 
+                q, " is to far from distribution median. Try plot() to see distribution."))
+        }
+    }
+    return(y_now)
+}
+
+rmetalog:::pdfMetalog_density
+function (m, t, y) 
+{
+    avec <- paste0("a", t)
+    a <- m$A[, avec]
+    bounds <- m$params$bounds
+    boundedness <- m$params$boundedness
+    d <- y * (1 - y)
+    f <- (y - 0.5)
+    l <- log(y/(1 - y))
+    x <- (a[2]/d)
+    if (a[3] != 0) {
+        x <- x + a[3] * ((f/d) + l)
+    }
+    if (t > 3) {
+        x <- x + a[4]
+    }
+    e <- 1
+    o <- 1
+    if (t > 4) {
+        for (i in 5:t) {
+            if (i%%2 != 0) {
+                x <- x + ((o + 1) * a[i] * f^o)
+                o <- o + 1
+            }
+            if (i%%2 == 0) {
+                x <- x + a[i] * (((f^(e + 1))/d) + (e + 1) * 
+                  (f^e) * l)
+                e <- e + 1
+            }
+        }
+    }
+    x <- (x^(-1))
+    if (boundedness != "u") {
+        M <- quantileMetalog(a, y, t, bounds = bounds, boundedness = "u")
+    }
+    if (boundedness == "sl") {
+        x <- x * exp(-M)
+    }
+    if (boundedness == "su") {
+        x <- x * exp(M)
+    }
+    if (boundedness == "b") {
+        x <- (x * (1 + exp(M))^2)/((bounds[2] - bounds[1]) * 
+            exp(M))
+    }
+    return(x)
+}
+
+rmetalog:::quantileMetalog
+function (a, y, t, bounds = c(), boundedness = "u") 
+{
+    f <- (y - 0.5)
+    l <- log(y/(1 - y))
+    x <- a[1] + a[2] * l + a[3] * f * l
+    if (t > 3) {
+        x <- x + a[4] * f
+    }
+    o <- 2
+    e <- 2
+    if (t > 4) {
+        for (i in 5:t) {
+            if (i%%2 == 0) {
+                x <- x + a[i] * f^e * l
+                e <- e + 1
+            }
+            if (i%%2 != 0) {
+                x <- x + a[i] * f^o
+                o <- o + 1
+            }
+        }
+    }
+    if (boundedness == "sl") {
+        x <- bounds[1] + exp(x)
+    }
+    if (boundedness == "su") {
+        x <- bounds[2] - exp(-x)
+    }
+    if (boundedness == "b") {
+        x <- (bounds[1] + bounds[2] * exp(x))/(1 + exp(x))
+    }
+    return(x)
+}
+
+rmetalog:::pdfMetalog
+function (a, y, t, bounds = c(), boundedness = "u") 
+{
+    d <- y * (1 - y)
+    f <- (y - 0.5)
+    l <- log(y/(1 - y))
+    x <- (a[2]/d)
+    if (a[3] != 0) {
+        x <- x + a[3] * ((f/d) + l)
+    }
+    if (t > 3) {
+        x <- x + a[4]
+    }
+    e <- 1
+    o <- 1
+    if (t > 4) {
+        for (i in 5:t) {
+            if (i%%2 != 0) {
+                x <- x + ((o + 1) * a[i] * f^o)
+                o <- o + 1
+            }
+            if (i%%2 == 0) {
+                x <- x + a[i] * (((f^(e + 1))/d) + (e + 1) * 
+                  (f^e) * l)
+                e <- e + 1
+            }
+        }
+    }
+    x <- (x^(-1))
+    if (boundedness != "u") {
+        M <- quantileMetalog(a, y, t, bounds = bounds, boundedness = "u")
+    }
+    if (boundedness == "sl") {
+        x <- x * exp(-M)
+    }
+    if (boundedness == "su") {
+        x <- x * exp(M)
+    }
+    if (boundedness == "b") {
+        x <- (x * (1 + exp(M))^2)/((bounds[2] - bounds[1]) * 
+            exp(M))
+    }
+    return(x)
+}
+
+
+rmetalog:::qmetalog.metalog
+function (m, y, term = 3) 
+{
+    valid_terms <- m$Validation$term
+    valid_terms_printout <- paste(valid_terms, collapse = " ")
+    if (class(y) != "numeric" | max(y) >= 1 | min(y) <= 0) {
+        stop("Error: y must be a positive numeric vector between 0 and 1")
+    }
+    if (class(term) != "numeric" | term < 2 | term%%1 != 0 | 
+        !(term %in% valid_terms) | length(term) > 1) {
+        stop(paste("Error: term must be a single positive numeric interger contained", 
+            "in the metalog object. Available terms are:", valid_terms_printout))
+    }
+    Y <- data.frame(y1 = rep(1, length(y)))
+    Y$y2 <- (log(y/(1 - y)))
+    if (term > 2) {
+        Y$y3 <- (y - 0.5) * Y$y2
+    }
+    if (term > 3) {
+        Y$y4 <- (y - 0.5)
+    }
+    if (term > 4) {
+        for (i in 5:(term)) {
+            y <- paste0("y", i)
+            if (i%%2 != 0) {
+                Y[y] <- Y$y4^(i%/%2)
+            }
+            if (i%%2 == 0) {
+                z <- paste0("y", (i - 1))
+                Y[y] <- Y$y2 * Y[z]
+            }
+        }
+    }
+    Y <- as.matrix(Y)
+    amat <- paste0("a", term)
+    a <- as.matrix(m$A[amat])
+    s <- Y %*% a[1:term]
+    if (m$params$boundedness == "sl") {
+        s <- m$params$bounds[1] + exp(s)
+    }
+    if (m$params$boundedness == "su") {
+        s <- m$params$bounds[2] - exp(-(s))
+    }
+    if (m$params$boundedness == "b") {
+        s <- (m$params$bounds[1] + (m$params$bounds[2]) * exp(s))/(1 + 
+            exp(s))
+    }
+    return(as.numeric(s))
+}
+
+
+rmetalog:::rmetalog.metalog
+function (m, n = 1, term = 3) 
+{
+    valid_terms <- m$Validation$term
+    valid_terms_printout <- paste(valid_terms, collapse = " ")
+    if (class(n) != "numeric" | n < 1 | n%%1 != 0) {
+        stop("Error: n must be a positive numeric interger")
+    }
+    if (class(term) != "numeric" | term < 2 | term%%1 != 0 | 
+        !(term %in% valid_terms) | length(term) > 1) {
+        stop(paste("Error: term must be a single positive numeric interger contained", 
+            "in the metalog object. Available terms are:", valid_terms_printout))
+    }
+    x <- stats::runif(n)
+    Y <- data.frame(y1 = rep(1, n))
+    Y$y2 <- (log(x/(1 - x)))
+    if (term > 2) {
+        Y$y3 <- (x - 0.5) * Y$y2
+    }
+    if (term > 3) {
+        Y$y4 <- x - 0.5
+    }
+    if (term > 4) {
+        for (i in 5:(term)) {
+            y <- paste0("y", i)
+            if (i%%2 != 0) {
+                Y[y] <- Y$y4^(i%/%2)
+            }
+            if (i%%2 == 0) {
+                z <- paste0("y", (i - 1))
+                Y[y] <- Y$y2 * Y[z]
+            }
+        }
+    }
+    Y <- as.matrix(Y)
+    amat <- paste0("a", term)
+    a <- as.matrix(m$A[amat])
+    s <- Y %*% a[1:term]
+    if (m$params$boundedness == "sl") {
+        s <- m$params$bounds[1] + exp(s)
+    }
+    if (m$params$boundedness == "su") {
+        s <- m$params$bounds[2] - exp(-(s))
+    }
+    if (m$params$boundedness == "b") {
+        s <- (m$params$bounds[1] + (m$params$bounds[2]) * exp(s))/(1 + 
+            exp(s))
+    }
+    return(as.numeric(s))
+}
+
+```
+

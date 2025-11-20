@@ -1,6 +1,13 @@
 .Rproj.user
 .Rhistory
-.Rdata
-.httr-oauth
+.RData
+.Ruserdata
+.Rapp.history
 .DS_Store
-.quarto
+reports/figure
+reports/*png
+reports/*html
+reports/*_cache
+reports/site_libs
+code/bcqrf_project_setup.Rmd
+code/bcqrf_project_setup.nb.html

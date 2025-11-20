@@ -1,0 +1,451 @@
+---
+title: "Constrained QRF"
+output: html_notebook
+---
+
+
+
+```{r}
+install.packages("quantregForest")
+
+```
+
+```{r}
+library(quantregForest)
+
+```
+
+```{r}
+set.seed(123) # For reproducibility
+N <- 200 # Number of observations
+X <- matrix(runif(N * 4), ncol=4) # Four predictors
+Y <- 2*X[,1] - 3*X[,2] + rnorm(N) # Response variable with some noise
+data <- data.frame(X, Y)
+
+```
+
+```{r}
+# Fit the Quantile Regression Forest model
+qrf_model <- quantregForest(X, Y)
+
+```
+
+```{r}
+# New data for prediction
+new_X <- matrix(runif(20 * 4), ncol=4)
+
+# Predict the 25th and 75th percentiles
+pred_25 <- predict(qrf_model, new_X, type = "quantile", quantile = 0.25)
+pred_75 <- predict(qrf_model, new_X, type = "quantile", quantile = 0.75)
+
+# Combine and review predictions
+predictions <- data.frame(Lower_Bound = pred_25, Upper_Bound = pred_75)
+print(predictions)
+
+```
+
+Novel approach to adaptively adjust predictions based on a predefined range of acceptable values, leveraging the flexibility of Quantile Regression Forests (QRF) to predict various percentiles of the conditional distribution of the target variable. This method essentially uses conditional quantiles to iteratively approach a prediction that falls within the known acceptable range, then fine-tunes the prediction based on the proximity of these quantiles to the range boundaries. Below are the steps to implement this strategy in R using the `quantregForest` package:
+
+### Step 1: Fit a Quantile Regression Forest Model
+
+Assuming you have already installed and loaded the `quantregForest` package and have your model fitted with `qrf_model`, as well as new data `new_X` for which you want to make predictions:
+
+```{r}
+# Assuming qrf_model is your fitted Quantile Regression Forest model
+# new_X is the new data for making predictions
+```
+
+### Step 2: Implement the Adaptive Prediction Adjustment
+
+Now, let’s implement the described adaptive prediction adjustment process:
+
+```{r}
+# Function to adaptively predict within the known range
+adaptive_prediction <- function(model, new_data, min_range, max_range) {
+  quantiles <- seq(0.5, 1, by = 0.1) # Define a sequence of quantiles to check
+  for (q in quantiles) {
+    pred <- predict(model, new_data, type = "quantile", quantile = 0.9)
+    
+    # Check if prediction is within the range
+    if (pred >= min_range & pred <= max_range) {
+      # If the prediction is within the range, calculate the median percentile
+      first_valid_q <- q
+      median_q <- (first_valid_q + 1) / 2 # Calculate the median percentile between the valid quantile and 100%
+      final_pred <- predict(model, new_data, what=c(seq(0.1, 0.9, by = 0.05)))
+      return(final_pred)
+    }
+    
+    # Adjust the quantiles based on whether the prediction is above or below the range
+    if (pred > max_range) {
+      quantiles <- seq(0.4, q - 0.1, by = -0.1)
+    } else if (pred < min_range) {
+      quantiles <- seq(0.6, q + 0.1, by = 0.1)
+    }
+  }
+  
+  # If no predictions fall within the range, return NA or consider a default action
+  return(NA)
+}
+model=qrf_model
+new_data = new_X[1,]
+# Example usage
+min_expected_value <- 30
+max_expected_value <- 50
+predictions <- adaptive_prediction(qrf_model, new_X, min_expected_value, max_expected_value)
+```
+
+### Explanation
+
+1. **Initial Prediction**: The function starts by predicting the median (50th percentile) and checks if this prediction falls within the known range.
+2. **Adaptive Adjustment**: If the median prediction is outside the range, the function then tries different percentiles (40th if above the range, 60th if below, etc.) to find a prediction within the range.
+3. **Fine-tuning**: Once a prediction falls within the range, the function calculates a final prediction based on the median percentile between the first valid prediction and the maximum or minimum constraint.
+4. **Fallback**: If no suitable prediction is found within the defined percentiles, the function returns `NA` or could be modified to return a default value.
+
+This approach provides a flexible method to ensure predictions adhere to known constraints, leveraging the comprehensive insights into the conditional distribution offered by QRF. Keep in mind, this iterative and adaptive prediction adjustment process might introduce a computational overhead, especially with large datasets or a large number of new predictions, due to the multiple calls to the `predict` function for each data point.
+
+
+
+
+
+
+
+
+
+
+
+The behavior you're experiencing with the `predict` function always returning the 0.1, 0.5, and 0.9 quantiles instead of varying quantiles might be due to a misunderstanding of how the function is being called or a limitation in the specific implementation you are using. In the context of Quantile Regression Forests (QRF) using the `quantregForest` package in R, the `predict` function allows you to specify any quantile between 0 and 1, and it should return the prediction for that specific quantile.
+
+Here's how you can adjust your approach to ensure you're getting the correct quantiles from the `predict` function and implement the adaptive quantile selection strategy based on known min and max range constraints:
+
+### Step 1: Initial Prediction at Median (50th Percentile)
+
+First, predict the median and evaluate it relative to the known range:
+
+```{r}
+library(quantregForest)
+
+# Assuming `qrf_model` is your trained Quantile Regression Forest model
+# And `new_X` is your new data for prediction
+
+median_pred <- predict(qrf_model, new_X, type = "quantile", quantile = 0.5)
+```
+
+### Step 2: Adaptive Quantile Selection
+
+Implement the adaptive approach where you adjust the quantile based on how the initial prediction compares to the known range:
+
+```{r}
+adjust_prediction_quantile <- function(pred, min_val, max_val) {
+  quantile <- 0.5  # Start with the median
+  step_size <- 0.1  # Adjust step size as needed
+  
+  while(TRUE) {
+    if(pred >= min_val && pred <= max_val) {
+      break  # The prediction is within the range
+    } else if(pred < min_val) {
+      quantile <- quantile + step_size  # Adjust quantile upwards
+      if(quantile > 1) {
+        quantile <- 1  # Cap at 100th percentile
+        break
+      }
+    } else if(pred > max_val) {
+      quantile <- quantile - step_size  # Adjust quantile downwards
+      if(quantile < 0) {
+        quantile <- 0  # Cap at 0th percentile
+        break
+      }
+    }
+    
+    # Make new prediction at adjusted quantile
+    pred <- predict(qrf_model, new_X, type = "quantile", quantile = quantile)
+    
+    # Check if multiple predictions needed, use first row as example
+    if(length(pred) > 1) pred <- pred[1]
+    
+    # Break loop if quantile adjustment did not alter prediction
+    # This is a simplistic check that may need refinement
+    if(quantile == 0 || quantile == 1) break
+  }
+  
+  return(list(prediction = pred, quantile = quantile))
+}
+
+# Assuming min_range and max_range are defined
+adjusted_preds <- lapply(median_pred, adjust_prediction_quantile, min_val = min_range, max_val = max_range)
+
+# Extract adjusted predictions and quantiles
+# Example for first prediction, generalize as needed
+first_adjusted_pred <- adjusted_preds[[1]]$prediction
+first_adjusted_quantile <- adjusted_preds[[1]]$quantile
+```
+
+### Caveat and Optimization
+
+The approach described here iteratively adjusts the quantile and makes a new prediction at each step until the prediction falls within the specified range or the quantile reaches its bounds (0 or 1). Note that this method may be computationally intensive, especially for large datasets, because it requires multiple predictions for each data point.
+
+Also, this example uses a simplistic condition to break the loop (`if(quantile == 0 || quantile == 1) break`), which may not be appropriate in all cases. You may need to refine this logic based on the specific behavior of your data and model predictions.
+
+Lastly, ensure that the version of `quantregForest` or the specific implementation you're using supports dynamic quantile predictions as expected. If the function does not behave as intended, double-check the documentation or consider updating the package.
+
+
+```{r}
+# Load necessary libraries
+library(ggplot2)
+library(dplyr)
+
+
+# Define the Bayesian updating function
+bayesian_update <- function(prior_distribution, likelihood_distribution, grid_range = NULL, grid_resolution = 0.01) {
+  # Determine the range of the grid dynamically if not provided
+  if (is.null(grid_range)) {
+    grid_min <- min(c(prior_distribution, likelihood_distribution)) - 1
+    grid_max <- max(c(prior_distribution, likelihood_distribution)) + 1
+  } else {
+    grid_min <- grid_range[1]
+    grid_max <- grid_range[2]
+  }
+  
+  # Define the value grid
+  value_grid <- seq(grid_min, grid_max, by = grid_resolution)
+  
+  # Estimate densities for the prior and likelihood
+  prior_density <- density(prior_distribution, bw = "nrd0", from = grid_min, to = grid_max, n = length(value_grid))
+  likelihood_density <- density(likelihood_distribution, bw = "nrd0", from = grid_min, to = grid_max, n = length(value_grid))
+  
+  # Interpolate densities to match the grid
+  prior_prob <- approxfun(prior_density$x, prior_density$y)(value_grid)
+  likelihood_prob <- approxfun(likelihood_density$x, likelihood_density$y)(value_grid)
+  
+  # Normalize densities to ensure they sum to 1 (if not already normalized)
+  prior_prob <- prior_prob / sum(prior_prob)
+  likelihood_prob <- likelihood_prob / sum(likelihood_prob)
+  
+  # Compute the posterior using Bayes' rule: posterior ∝ prior * likelihood
+  posterior_prob <- prior_prob * likelihood_prob
+  posterior_prob <- posterior_prob / sum(posterior_prob)  # Normalize posterior
+  
+  # Sample from the posterior
+  posterior_samples <- sample(value_grid, size = 1000, prob = posterior_prob, replace = TRUE)
+  
+  # Return the posterior samples as the constrained distribution
+  return(posterior_samples)
+}
+
+```
+
+
+
+# Example Corrections
+
+```{r}
+# Example for a soil property (e.g., bulk density)
+set.seed(42)
+
+# Simulate prior and likelihood distributions
+empirical_prior <- c(rnorm(500, mean = 1.3, sd = 0.2), runif(200, min = 0.8, max = 1.0))
+model_predictions <- c(rnorm(700, mean = 1.6, sd = 0.1), rnorm(300, mean = 1.7, sd = 0.1))
+
+# Perform Bayesian updating
+posterior_samples <- bayesian_update(
+  prior_distribution = empirical_prior, 
+  likelihood_distribution = model_predictions, 
+  grid_range = c(0.5, 2.0),  # Explicitly set the range for this soil property
+  grid_resolution = 0.001   # High resolution for precise calculations
+)
+
+# Combine distributions into a data frame for visualization
+data <- data.frame(
+  Value = c(empirical_prior, model_predictions, posterior_samples),
+  Distribution = factor(c(
+    rep("Prior (SSURGO-Mapunit)", length(empirical_prior)),
+    rep("Likelihood (SOLUS-QRF predictions at selected pixel)", length(model_predictions)),
+    rep("Posterior (SSURGO Constrained SOLUS)", length(posterior_samples))
+  ))
+)
+
+# Visualize the distributions
+ggplot(data, aes(x = Value, fill = Distribution)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Bayesian Updating for Bulk Density",
+       x = "Bulk Density (g/cm³)",
+       y = "Density") +
+  theme_minimal() +
+  scale_fill_manual(values = c("skyblue", "salmon", "lightgreen")) +
+  scale_x_continuous(limits = c(0.5, 2.0), breaks = seq(0.5, 2.0, by = 0.1))
+
+
+
+# Example: Soil pH
+set.seed(42)
+
+# Simulate prior distribution (empirical knowledge)
+empirical_prior <- c(rnorm(500, mean = 6.5, sd = 0.5), runif(200, min = 5.5, max = 6.0))
+
+# Simulate likelihood distribution (model predictions, biased towards lower values)
+model_predictions <- c(rnorm(700, mean = 5.0, sd = 0.3), rnorm(300, mean = 5.2, sd = 0.3))
+
+# Perform Bayesian updating with the bayesian_update function
+posterior_samples <- bayesian_update(
+  prior_distribution = empirical_prior,
+  likelihood_distribution = model_predictions,
+  grid_range = c(4.5, 7.5),  # Range wide enough to capture both distributions
+  grid_resolution = 0.001   # High resolution for detailed posterior
+)
+
+# Combine distributions into a data frame for visualization
+data <- data.frame(
+  Value = c(empirical_prior, model_predictions, posterior_samples),
+  Distribution = factor(c(
+    rep("Prior (SSURGO-Mapunit)", length(empirical_prior)),
+    rep("Likelihood (SOLUS-QRF predictions at selected pixel)", length(model_predictions)),
+    rep("Posterior (SSURGO Constrained SOLUS)", length(posterior_samples))
+  ))
+)
+
+# Visualize the distributions
+ggplot(data, aes(x = Value, fill = Distribution)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Bayesian Updating: Model Predictions Below Empirical Prior",
+       x = "Soil pH",
+       y = "Density") +
+  theme_minimal() +
+  scale_fill_manual(values = c("skyblue", "salmon", "lightgreen")) +
+  scale_x_continuous(limits = c(4.5, 7.5), breaks = seq(4.5, 7.5, by = 0.5))+
+  scale_x_continuous(limits = c(4, 8), breaks = seq(4, 8, by = 0.5))
+
+
+
+# Example: Soil Organic Carbon
+set.seed(42)
+
+# Simulate prior distribution (empirical knowledge)
+empirical_prior <- c(rnorm(500, mean = 3.5, sd = 0.8), runif(200, min = 2.5, max = 4.0))
+
+# Simulate likelihood distribution (model predictions, well-aligned with prior)
+model_predictions <- c(rnorm(700, mean = 3.6, sd = 0.4), rnorm(300, mean = 3.4, sd = 0.3))
+
+# Perform Bayesian updating with the bayesian_update function
+posterior_samples <- bayesian_update(
+  prior_distribution = empirical_prior,
+  likelihood_distribution = model_predictions,
+  grid_range = c(2.0, 5.0),  # Range wide enough to capture both distributions
+  grid_resolution = 0.001   # High resolution for detailed posterior
+)
+
+# Combine distributions into a data frame for visualization
+data <- data.frame(
+  Value = c(empirical_prior, model_predictions, posterior_samples),
+  Distribution = factor(c(
+    rep("Prior (SSURGO-Mapunit)", length(empirical_prior)),
+    rep("Likelihood (SOLUS-QRF predictions at selected pixel)", length(model_predictions)),
+    rep("Posterior (SSURGO Constrained SOLUS)", length(posterior_samples))
+  ))
+)
+
+# Visualize the distributions
+ggplot(data, aes(x = Value, fill = Distribution)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Bayesian Updating: When the Prior and Likelihood are Aligned",
+       x = "Soil Organic Carbon (%)",
+       y = "Density") +
+  theme_minimal() +
+  scale_fill_manual(values = c("skyblue", "salmon", "lightgreen")) +
+  scale_x_continuous(limits = c(1.0, 6.0), breaks = seq(1.0, 6.0, by = 0.5))
+
+```
+
+
+
+```{r}
+
+most_representative_instance <- function(independent_samples, correlation_matrix) {
+#'
+#' This function adjusts the between-property correlations for each depth/horizon
+#' after depth-wise adjustments using Cholesky decomposition. It assumes that
+#' the properties are already adjusted for depth-wise trends and now need to
+#' conform to a specific correlation matrix within each horizon.
+#'
+#' @param independent_samples A matrix of properties representing independent property distributions at a set depth.
+#'        Each row is a horizon or depth layer, and each column is a property (e.g., sand, silt, clay).
+#' @param correlation_matrix A square matrix specifying the desired correlations between
+#'        the variables (e.g., sand, silt, clay, bulk density, etc.). It must be positive
+#'        semi-definite and of size equal to the number of properties (columns).
+#'
+#' @return A matrix of adjusted properties with the desired between-property correlations.
+
+# Check if the correlation matrix is positive semi-definite
+  if (!isSymmetric(correlation_matrix) || any(eigen(correlation_matrix)$values < 0)) {
+    stop("Correlation matrix must be symmetric and positive semi-definite.")
+  }
+
+  # Cholesky decomposition of the correlation matrix
+  L <- chol(correlation_matrix)
+
+  # Generate correlated normal variables based on the adjusted properties
+  n <- nrow(independent_samples)
+  uncorrelated_normal <- MASS::mvrnorm(n, mu = rep(0, ncol(independent_samples)), Sigma = diag(ncol(independent_samples)))
+
+  # Compute the correlated normal variables by multiplying with L
+  correlated_normal <- uncorrelated_normal %*% L
+  correlated_samples <- independent_samples
+  # Adjust each property's distribution using the cumulative distribution function (CDF)
+  for (i in seq_len(ncol(correlated_samples))) {
+    # Use the CDF of the adjusted properties to match the new correlated normal variables
+    u <- pnorm(correlated_normal[, i])
+
+    # Re-map the correlated normal variable to the adjusted property range
+    correlated_samples[, i] <- quantile(correlated_samples[, i], u)
+  }
+
+  # Compute Mahalanobis distance for representativeness
+  mu <- colMeans(correlated_samples)  # Mean vector of correlated samples
+  inv_cov <- solve(cov(correlated_samples))  # Inverse covariance matrix
+  mahalanobis_distances <- apply(correlated_samples, 1, function(x) {
+    t(x - mu) %*% inv_cov %*% (x - mu)
+  })
+  
+  # Identify the most representative point (smallest Mahalanobis distance)
+  most_representative_index <- which.min(mahalanobis_distances)
+  most_representative_instance <- correlated_samples[most_representative_index, ]
+  
+  # Return the result
+  return(list(
+    most_representative_instance = most_representative_instance,
+    correlated_samples = correlated_samples
+  ))
+}
+```
+
+
+```{r}
+# Example: Soil properties (bulk density, organic carbon, pH)
+set.seed(42)
+
+# Generate independent samples for each soil property
+independent_samples <- data.frame(
+  bulk_density = rnorm(1000, mean = 1.4, sd = 0.2),
+  organic_carbon = rnorm(1000, mean = 3.5, sd = 0.8),
+  pH = rnorm(1000, mean = 6.5, sd = 0.5)
+)
+
+# Define correlation matrix
+correlation_matrix <- matrix(c(
+  1.0, 0.4, 0.3,
+  0.4, 1.0, 0.5,
+  0.3, 0.5, 1.0
+), nrow = 3, byrow = TRUE)
+
+# Call the function
+result <- most_representative_instance(independent_samples, correlation_matrix)
+
+# Extract the most representative instance
+most_representative_instance <- result$most_representative_instance
+cat("Most Representative Instance:\n")
+print(most_representative_instance)
+
+# Visualize pairwise scatterplots
+pairs(result$correlated_samples, main = "Correlated Soil Properties (0-30 cm)")
+points(most_representative_instance[1], most_representative_instance[2], col = "red", pch = 19)
+
+```
+

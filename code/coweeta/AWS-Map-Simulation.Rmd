@@ -1,0 +1,642 @@
+---
+title: "Soil Available Water Storage Simulation"
+author: "J.J. Maynard"
+output: html_notebook
+---
+
+This R Notebook describes and demonstrates soil simulation modeling of SSURGO soil property data, leveraging sources of know uncertainty to better estimate the potential variability of soil properties, including both primary (e.g., texture, rock fragments) and derived using pedotransfer functions (e.g., PAWHC), and the propagation of uncertainty when generating derived data.
+
+
+```{r}
+# Load libraries
+library(dplyr)
+library(purrr)
+library(compositions)
+library(MASS)
+library(tidyr)
+library(Hmisc)
+library(ggplot2)
+library(here)
+library(terra)
+library(soilDB)
+library(rasterVis)
+library(viridisLite)
+library(sf)
+library(aqp)
+library(GPfit)
+library(future.apply)
+
+
+library(furrr)
+library(future)
+
+# Load local functions
+source(here('code/sim-functions.R'))
+```
+
+
+# Step 1: Simulate synthetic soil profile instances from the joint-probability distribution of soil properties required to calculate available soil water storage.
+
+# Step 1.0 Extract all ssurgo data in study area via SDA or load RSS data 
+```{r}
+# Choose which data source to run simulations
+
+# Option 1: *** RUN SIMULATION WITH gSSURGO ***
+# Extract mukeys from rasterized SSURGO data
+s.rast <- rast(here('data/grids/ssurgo_utm.tif'))
+rat <- cats(s.rast)[[1]]
+mukeys <- as.numeric(rat$mukey)
+
+# Get SSURGO data
+ssurgo_data <- get_aws_data_by_mukey(mukeys)
+ssurgo_data$cokey <- as.integer(ssurgo_data$cokey)
+ssurgo_data$id <- ssurgo_data$cokey
+
+
+# Option 2: *** RUN SIMULATION WITH RSS ***
+# setup RSS data to run in place of SSURGO
+load(here('data/rss-tab-data-raw.rda'))
+ssurgo_data <- rss.hz %>% left_join(rss.co %>% dplyr::select(mukey, cokey, compname, comppct_l, comppct_r, comppct_h), by="cokey")
+ssurgo_data$cokey <- sub(".*:(\\d+)", "\\1", ssurgo_data$cokey)
+ssurgo_data$cokey <- as.integer(ssurgo_data$cokey)
+ssurgo_data$id <- ssurgo_data$cokey
+
+ssurgo_data <- ssurgo_data %>%
+  mutate(
+    rfv_l = fraggt10_l + frag3to10_l,  # Total low estimate
+    rfv_r = fraggt10_r + frag3to10_r,  # Total representative estimate
+    rfv_h = fraggt10_h + frag3to10_h   # Total high estimate
+  )
+
+ssurgo_data <- ssurgo_data %>%dplyr::select(id, mukey, cokey, compname, comppct_l, comppct_r, comppct_h, chkey, hzname, hzdept_l, hzdept_r, hzdept_h, hzdepb_l, hzdepb_r, hzdepb_h, hzthk_l, hzthk_r, hzthk_h, sandtotal_l, sandtotal_r, sandtotal_h, silttotal_l, silttotal_r, silttotal_h, claytotal_l, claytotal_r, claytotal_h, dbovendry_l, dbovendry_r, dbovendry_h, wthirdbar_l, wthirdbar_r, wthirdbar_h, wfifteenbar_l, wfifteenbar_r, wfifteenbar_h, rfv_l, rfv_r, rfv_h)
+
+```
+
+
+# Step 1.1 Simulate variablity of component percent composition to determine the number of simulations to run for each map unit component.
+```{r}
+#mukey-wise calcualtion of simulated comppct
+
+ssurgo_comppct_sim <- ssurgo_data %>%
+  group_by(mukey) %>%
+  do({
+    # Apply sim_component_comp to each group (subset) of rows
+    sim_component_comp(., n_simulations = 1000)
+  }) %>% ungroup()
+
+
+ssurgo_data <- ssurgo_data %>% left_join(ssurgo_comppct_sim %>% dplyr::select(cokey, sim_comppct), by="cokey")
+
+# Remove organic layers if present
+if (any(grepl("O", ssurgo_data$hzname))) {
+  ssurgo_data <- remove_organic_layer(ssurgo_data)
+}
+
+```
+
+
+# Step 1.2 Simulate soil profile depths
+```{r}
+# Create a Soil Profile Collection
+ssurgo_data <- ssurgo_data %>% as.data.frame()
+depths(ssurgo_data) <- id ~ hzdept_r + hzdepb_r
+hzdesgnname(ssurgo_data) <- "hzname"
+res <- checkHzDepthLogic(ssurgo_data)
+# Simulate soil profile horizon depth variability
+ssurgo_depth_simulation <- simulate_profile_depths_by_collection_parallel(ssurgo_data, seed = 123, n_cores = 6)
+
+```
+
+
+# Step 1.3 Simulate soil properties
+```{r}
+ssurgo_soil_sim_df <- simulate_soil_properties(ssurgo_data@horizons)
+```
+
+
+# Step 2: Reshape the data into depth-wise matrices
+```{r}
+# Define the properties you want to process
+properties <- c("bulk_density_third_bar", "water_retention_third_bar", "water_retention_15_bar",
+                "rfv", "sand_total", "silt_total", "clay_total")
+
+# Process the soil data
+final_processed_data <- adjust_soil_data(ssurgo_soil_sim_df, properties)
+
+```
+
+# Combine simulated depths w/ simulated properties
+```{r}
+ssurgo_depth_simulation_data <- ssurgo_depth_simulation@horizons
+
+# Add hzname from ssurgo_data
+ssurgo_df <- ssurgo_data@horizons %>% dplyr::select(cokey, hzname, hzdept_r, hzdepb_r)
+final_processed_data <- final_processed_data %>% left_join(ssurgo_df, by=c('cokey' = 'cokey', 'hzdept_r'='hzdept_r', 'hzdepb_r'= 'hzdepb_r'))
+
+
+ssurgo_depth_property_sim <- ssurgo_depth_simulation_data %>% left_join(final_processed_data %>% dplyr::select(unique_id, hzname, bulk_density_third_bar, water_retention_third_bar, water_retention_15_bar, rfv, sand_total,silt_total, clay_total), by = c('id'='unique_id', 'hzname'='hzname'))
+
+View(ssurgo_depth_property_sim)
+
+depths(ssurgo_depth_property_sim) <- id ~ hzdept_r + hzdepb_r
+
+
+save(ssurgo_depth_property_sim, final_processed_data, ssurgo_depth_simulation, file = here('data/coweeta-soil-sim-data.rda'))
+
+
+aws_df <- calculate_aws_df(ssurgo_depth_property_sim@horizons)
+
+
+```
+
+
+
+
+
+# Plot GP model
+```{r}
+# Define the properties you want to process
+properties <- c("bulk_density_third_bar", "water_retention_third_bar", "water_retention_15_bar",
+                "rfv", "sand_total", "silt_total", "clay_total")
+
+# Process the soil data
+final_processed_data <- adjust_soil_data(ssurgo_soil_sim_df, properties)
+
+
+
+
+
+# Reshape clay data into a matrix where each row is a depth and each column is a simulation
+simulated_clay_matrix <- matrix(simulated_clay, nrow = n_depths, ncol = n_simulations, byrow = TRUE)
+
+depths <- seq(0, 1, by = 0.1)
+# Compute the mean values at each depth
+mean_clay <- rowMeans(simulated_clay_matrix)
+
+
+# Fit a GP model using the mean values
+gp_model <- GP_fit(X = as.matrix(depths), Y = mean_clay)
+
+# Get GP-predicted means for all depths
+gp_pred_means <- predict.GP(gp_model, xnew = as.matrix(depths))$Y_hat
+gp_pred_sd <- sqrt(predict.GP(gp_model, xnew = as.matrix(depths))$MSE)
+simulated_clay_adjust <- adjust_depthwise_property_GP_Quant(simulated_clay_matrix, gp_model, depths)
+
+# depth-wise property mean and sd
+mean_clay_adj <- rowMeans(simulated_clay_adjust)
+sd_clay_adj <- apply(simulated_clay_adjust, 1, sd)
+sd_clay <- apply(simulated_clay_matrix, 1, sd)
+# Reshape the adjusted matrix to long format for ggplot2
+simulated_clay_adjust_long <- melt(simulated_clay_adjust)
+simulated_clay_adjust_long$depth <- rep(seq(0, 100, by = 10), times = ncol(simulated_clay_adjust))
+colnames(simulated_clay_adjust_long) <- c("variable", "simulation", "clay", "depth")
+
+simulated_clay_long <- melt(simulated_clay_matrix)
+simulated_clay_long$depth <- rep(seq(0, 100, by = 10), times = ncol(simulated_clay_matrix))
+colnames(simulated_clay_long) <- c("variable", "simulation", "clay", "depth")
+
+# Combine the predicted GP means with the depth for plotting
+gp_pred_data <- data.frame(
+  depth = seq(0, 100, by = 10),
+  clay = gp_pred_means
+)
+
+
+
+
+# Refined plot for better axis visibility and text positioning
+plot <- ggplot() +
+  # Plot the mean GP predictions as a line
+  geom_line(aes(x = gp_pred_means, y = depths ), color = 'red', size = 1.5) +
+  
+  # Add a ribbon to represent the variability of GP model predictions
+  geom_ribbon(aes(xmin = gp_pred_means - 1.96 * sd_clay, 
+                  xmax = gp_pred_means + 1.96 * sd_clay, 
+                  y = depths), 
+              fill = 'red', alpha = 0.15) +  # Lighter ribbon
+  
+  # Plot the adjusted simulated data points
+  # geom_point(data = simulated_clay_adjust_long, aes(x = clay, y = depth), 
+  #            color = "blue", alpha = 0.6, size = 2) +
+  
+  # Labels and formatting
+  labs(title = "Gaussian Process Prediction for Clay Content by Depth",
+       x = "Clay Content (%)", y = "Depth (cm)") +
+  
+  # Reverse y-axis to have depth increasing downward
+  scale_y_reverse() +
+  
+  # Add axis lines and make axis text visible
+  theme_minimal(base_size = 14) +
+  theme(panel.grid = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.text = element_text(color = "black")) +
+  
+  # Move the GP Predictions text to the right
+  annotate("text", x = max(mean_clay_adj), y = 0, label = "GP Predictions", color = "red", hjust = 0, size = 5) +
+  
+  # Move the Simulated Data text to the left
+  annotate("text", x = min(mean_clay_adj), y = max(depths * 100), label = "Simulated Data", color = "blue", hjust = 1, size = 5)
+
+# Save the final plot with improved appearance
+ggsave("clay_content_prediction_refined.png", plot = plot, 
+       width = 8, height = 6, units = "in", dpi = 300)
+
+
+
+```
+
+
+
+
+To calculate soil water retention at field capacity (FC) and permanent wilting point (PWP) using the van Genuchten equation, incorporating uncertainty in the van Genuchten parameters (from ROSETTA3 output), we can simulate multiple parameter sets based on their estimated uncertainty and calculate soil water retention for each set.
+
+### Van Genuchten Equation:
+The van Genuchten equation for soil water retention is:
+
+\[
+\theta(h) = \theta_r + \frac{\theta_s - \theta_r}{(1 + |\alpha h|^n)^{m}}
+\]
+
+Where:
+- \(\theta(h)\): volumetric water content at matric potential \(h\)
+- \(\theta_r\): residual water content
+- \(\theta_s\): saturated water content
+- \(\alpha\): van Genuchten parameter (related to the inverse of the air entry suction)
+- \(n\): van Genuchten parameter (shape parameter)
+- \(m = 1 - \frac{1}{n}\)
+- \(h\): matric potential (suction)
+
+Field capacity (FC) corresponds to \(h = -33 \, kPa\) and permanent wilting point (PWP) to \(h = -1500 \, kPa\).
+
+### Steps:
+1. Simulate multiple realizations of the van Genuchten parameters based on their uncertainties (e.g., means and standard deviations from ROSETTA3).
+2. For each realization, compute soil water retention at FC and PWP using the van Genuchten equation.
+3. Aggregate the results to represent uncertainty (e.g., mean and confidence intervals of \(\theta(h)\)).
+
+### Sample R Code
+```{r}
+
+# attempting to use all possible soil properties
+vars <- c('sandtotal_r', 'silttotal_r', 'claytotal_r', 'dbthirdbar_r', 'wthirdbar_decimal', 'wfifteenbar_decimal')
+
+# call ROSETTA API 
+r <- ROSETTA(x, vars = vars, include.sd = TRUE)
+```
+
+
+```{r}
+# Load required libraries
+library(dplyr)
+
+# Define the van Genuchten equation function
+van_genuchten <- function(h, alpha, n, theta_r, theta_s) {
+  m <- 1 - (1 / n)
+  theta_r + (theta_s - theta_r) / ((1 + (abs(alpha * h))^n)^m)
+}
+
+# Function to simulate van Genuchten parameters and calculate AWHC
+simulate_van_genuchten <- function(data, n_simulations = 1000) {
+  
+  # Initialize result list
+  simulation_results <- list()
+  
+  # Iterate over each row in the data
+  for (i in 1:nrow(data)) {
+    
+    # Extract values for the current component from the data table
+    alpha_mean <- data$alpha[i]
+    alpha_sd <- data$sd_alpha[i]
+    n_mean <- data$npar[i]
+    n_sd <- data$sd_npar[i]
+    theta_r_mean <- data$theta_r[i]
+    theta_r_sd <- data$sd_theta_r[i]
+    theta_s_mean <- data$theta_s[i]
+    theta_s_sd <- data$sd_theta_s[i]
+    
+    # If there are NA values, skip that row
+    if (is.na(alpha_mean) | is.na(n_mean) | is.na(theta_r_mean) | is.na(theta_s_mean)) {
+      next
+    }
+    
+    # Generate random samples of the van Genuchten parameters based on their uncertainties
+    set.seed(123) # For reproducibility
+    alpha_samples <- rnorm(n_simulations, mean = alpha_mean, sd = alpha_sd)
+    n_samples <- rnorm(n_simulations, mean = n_mean, sd = n_sd)
+    theta_r_samples <- rnorm(n_simulations, mean = theta_r_mean, sd = theta_r_sd)
+    theta_s_samples <- rnorm(n_simulations, mean = theta_s_mean, sd = theta_s_sd)
+    
+    # Matric potentials for field capacity (FC) and permanent wilting point (PWP)
+    h_fc <- -33   # Field capacity matric potential in kPa
+    h_pwp <- -1500 # Permanent wilting point matric potential in kPa
+    
+    # Create a data frame for the sampled parameters
+    results <- data.frame(
+      alpha = alpha_samples,
+      n = n_samples,
+      theta_r = theta_r_samples,
+      theta_s = theta_s_samples
+    )
+    
+    # Calculate water retention at FC and PWP for each set of sampled parameters
+    results <- results %>%
+      rowwise() %>%
+      mutate(
+        theta_fc = van_genuchten(h_fc, alpha, n, theta_r, theta_s),
+        theta_pwp = van_genuchten(h_pwp, alpha, n, theta_r, theta_s)
+      ) %>%
+      ungroup()
+    
+    # Calculate AWHC (Available Water Holding Capacity) as the difference between FC and PWP
+    results$AWHC <- results$theta_fc - results$theta_pwp
+    
+    # Store results with component name and horizon name
+    simulation_results[[paste(data$compname[i], data$hzname[i], sep = "_")]] <- results
+  }
+  
+  return(simulation_results)
+}
+
+
+out <- simulate_van_genuchten(r, n_simulations = 1000)
+  
+```
+
+```{r}
+# Required Libraries
+library(dplyr)
+
+# Van Genuchten equation function
+van_genuchten <- function(h, alpha, n, theta_r, theta_s) {
+  m <- 1 - (1 / n)
+  theta_r + (theta_s - theta_r) / ((1 + ((alpha * h))^n)^m)
+}
+
+# Parameters from ROSETTA3 (mean and standard deviations of alpha, n, theta_r, and theta_s)
+# These should be substituted by actual values output from ROSETTA3
+alpha_mean <- 0.08   # Mean value for alpha (cm^-1)
+alpha_sd <- 0.01     # Standard deviation for alpha
+n_mean <- 1.5        # Mean value for n
+n_sd <- 0.1          # Standard deviation for n
+theta_r_mean <- 0.05 # Mean value for residual water content
+theta_r_sd <- 0.01   # Standard deviation for residual water content
+theta_s_mean <- 0.45 # Mean value for saturated water content
+theta_s_sd <- 0.02   # Standard deviation for saturated water content
+
+# Number of simulations to perform (you can increase this for higher precision)
+n_simulations <- 1000
+
+# Generate random samples of the van Genuchten parameters based on their uncertainties
+set.seed(123) # For reproducibility
+alpha_samples <- rnorm(n_simulations, mean = alpha_mean, sd = alpha_sd)
+n_samples <- rnorm(n_simulations, mean = n_mean, sd = n_sd)
+theta_r_samples <- rnorm(n_simulations, mean = theta_r_mean, sd = theta_r_sd)
+theta_s_samples <- rnorm(n_simulations, mean = theta_s_mean, sd = theta_s_sd)
+
+# Matric potentials for field capacity (FC) and permanent wilting point (PWP)
+h_fc <- -33   # Field capacity matric potential in kPa
+h_pwp <- -1500 # Permanent wilting point matric potential in kPa
+
+# Calculate water retention at FC and PWP for each set of sampled parameters
+results <- data.frame(
+  alpha = alpha_samples,
+  n = n_samples,
+  theta_r = theta_r_samples,
+  theta_s = theta_s_samples
+) %>%
+  rowwise() %>%
+  mutate(
+    theta_fc = van_genuchten(h_fc, alpha, n, theta_r, theta_s),
+    theta_pwp = van_genuchten(h_pwp, alpha, n, theta_r, theta_s)
+  ) %>% ungroup()
+
+# Calculate AWHC (Available Water Holding Capacity) as the difference between FC and PWP
+results$AWHC <- results$theta_fc - results$theta_pwp
+
+# Summarize results (mean, standard deviation, and confidence intervals)
+summary_fc <- summarize(
+  results,
+  mean_theta_fc = mean(theta_fc),
+  sd_theta_fc = sd(theta_fc),
+  ci_lower_fc = quantile(theta_fc, probs = 0.025),
+  ci_upper_fc = quantile(theta_fc, probs = 0.975)
+)
+
+summary_pwp <- summarize(
+  results,
+  mean_theta_pwp = mean(theta_pwp),
+  sd_theta_pwp = sd(theta_pwp),
+  ci_lower_pwp = quantile(theta_pwp, probs = 0.025),
+  ci_upper_pwp = quantile(theta_pwp, probs = 0.975)
+)
+
+# Display summary for FC and PWP
+print("Field Capacity (FC) Water Retention:")
+print(summary_fc)
+
+print("Permanent Wilting Point (PWP) Water Retention:")
+print(summary_pwp)
+
+library(ggplot2)
+# Plot histogram for Field Capacity (FC) water retention
+ggplot(results, aes(x = theta_fc)) +
+  geom_histogram(binwidth = 0.01, fill = "blue", color = "black", alpha = 0.7) +
+  geom_vline(aes(xintercept = summary_fc$mean_theta_fc), color = "black", linetype = "solid", size = 1, 
+             show.legend = TRUE) +  # Mean line
+  geom_vline(aes(xintercept = summary_fc$mean_theta_fc + summary_fc$sd_theta_fc), color = "darkgreen", linetype = "dashed", size = 1) +  # +1 SD
+  geom_vline(aes(xintercept = summary_fc$mean_theta_fc - summary_fc$sd_theta_fc), color = "darkgreen", linetype = "dashed", size = 1) +  # -1 SD
+  geom_vline(aes(xintercept = summary_fc$ci_lower_fc), color = "red", linetype = "dotted", size = 1) +  # Lower 95% CI
+  geom_vline(aes(xintercept = summary_fc$ci_upper_fc), color = "red", linetype = "dotted", size = 1) +  # Upper 95% CI
+  labs(title = "Water Retention at Field Capacity (FC) with Mean, SD, and CI",
+       x = "Water Retention at FC (θ)",
+       y = "Frequency") +
+  theme_minimal()
+
+# Plot histogram for Permanent Wilting Point (PWP) water retention
+ggplot(results, aes(x = theta_pwp)) +
+  geom_histogram(binwidth = 0.01, fill = "red", color = "black", alpha = 0.7) +
+  geom_vline(aes(xintercept = summary_pwp$mean_theta_pwp), color = "black", linetype = "solid", size = 1) +  # Mean line
+  geom_vline(aes(xintercept = summary_pwp$mean_theta_pwp + summary_pwp$sd_theta_pwp), color = "darkgreen", linetype = "dashed", size = 1) +  # +1 SD
+  geom_vline(aes(xintercept = summary_pwp$mean_theta_pwp - summary_pwp$sd_theta_pwp), color = "darkgreen", linetype = "dashed", size = 1) +  # -1 SD
+  geom_vline(aes(xintercept = summary_pwp$ci_lower_pwp), color = "red", linetype = "dotted", size = 1) +  # Lower 95% CI
+  geom_vline(aes(xintercept = summary_pwp$ci_upper_pwp), color = "red", linetype = "dotted", size = 1) +  # Upper 95% CI
+  labs(title = "Water Retention at Permanent Wilting Point (PWP) with Mean, SD, and CI",
+       x = "Water Retention at PWP (θ)",
+       y = "Frequency") +
+  theme_minimal()
+
+
+# Calculate summary statistics (mean, sd, and confidence intervals) for AWHC
+summary_awhc <- data.frame(
+  mean_awhc = mean(results$AWHC),
+  sd_awhc = sd(results$AWHC),
+  ci_lower_awhc = quantile(results$AWHC, probs = 0.025),
+  ci_upper_awhc = quantile(results$AWHC, probs = 0.975)
+)
+
+# Print the summary statistics for AWHC
+print("Available Water Holding Capacity (AWHC) Summary:")
+print(summary_awhc)
+
+# Plot frequency distribution for AWHC
+ggplot(results, aes(x = AWHC)) +
+  geom_histogram(binwidth = 0.01, fill = "purple", color = "black", alpha = 0.7) +
+  geom_vline(aes(xintercept = summary_awhc$mean_awhc), color = "black", linetype = "solid", size = 1) +  # Mean line
+  geom_vline(aes(xintercept = summary_awhc$mean_awhc + summary_awhc$sd_awhc), color = "darkgreen", linetype = "dashed", size = 1) +  # +1 SD
+  geom_vline(aes(xintercept = summary_awhc$mean_awhc - summary_awhc$sd_awhc), color = "darkgreen", linetype = "dashed", size = 1) +  # -1 SD
+  geom_vline(aes(xintercept = summary_awhc$ci_lower_awhc), color = "red", linetype = "dotted", size = 1) +  # Lower 95% CI
+  geom_vline(aes(xintercept = summary_awhc$ci_upper_awhc), color = "red", linetype = "dotted", size = 1) +  # Upper 95% CI
+  labs(title = "Frequency Distribution of Available Water Holding Capacity (AWHC)",
+       x = "Available Water Holding Capacity (AWHC)",
+       y = "Frequency") +
+  theme_minimal()
+```
+
+
+```{r}
+# Load necessary libraries
+library(ggplot2)
+
+# Plot the frequency distribution of AWHC with enhanced aesthetics
+awhc_plot <- ggplot(results, aes(x = AWHC)) +
+  geom_histogram(binwidth = 0.01, fill = "purple", color = "black", alpha = 0.7) +
+  geom_vline(aes(xintercept = summary_awhc$mean_awhc), color = "black", linetype = "solid", size = 1) +  # Mean line
+  geom_vline(aes(xintercept = summary_awhc$mean_awhc + summary_awhc$sd_awhc), color = "darkgreen", linetype = "dashed", size = 1) +  # +1 SD
+  geom_vline(aes(xintercept = summary_awhc$mean_awhc - summary_awhc$sd_awhc), color = "darkgreen", linetype = "dashed", size = 1) +  # -1 SD
+  geom_vline(aes(xintercept = summary_awhc$ci_lower_awhc), color = "red", linetype = "dotted", size = 1) +  # Lower 95% CI
+  geom_vline(aes(xintercept = summary_awhc$ci_upper_awhc), color = "red", linetype = "dotted", size = 1) +  # Upper 95% CI
+  labs(title = "Available Water Holding Capacity (AWHC) Distribution",
+       x = "AWHC (Field Capacity - Wilting Point)",
+       y = "Frequency") +
+  theme_minimal() +
+  theme(
+    text = element_text(family = "serif", size = 12),  # Change font to serif for publication
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),  # Center and bold title
+    axis.title.x = element_text(face = "bold", size = 12),  # Bold x-axis label
+    axis.title.y = element_text(face = "bold", size = 12),  # Bold y-axis label
+    panel.grid.major = element_line(size = 0.2, color = "gray"),  # Customize grid lines
+    panel.grid.minor = element_blank(),  # Remove minor grid lines for clarity
+    axis.text = element_text(size = 10),  # Adjust axis tick labels
+    axis.ticks = element_line(size = 0.3)  # Thicker axis ticks
+  )
+
+# Print the enhanced plot to the RStudio viewer
+print(awhc_plot)
+
+# Save the plot as a high-resolution image for publication
+ggsave(filename = "AWHC_Distribution_Publication.png", plot = awhc_plot, width = 8, height = 6, dpi = 300)
+
+```
+```{r}
+# van Genuchten function with unit conversion
+van_genuchten <- function(h, alpha, n, theta_r, theta_s) {
+  m <- 1 - (1 / n)
+  theta_r + (theta_s - theta_r) / ((1 + (abs(alpha * h))^n)^m)
+}
+
+# Function to calculate water retention at specific matric potentials
+calculate_water_retention <- function(data, n_simulations = 1000) {
+  
+  # Initialize result list
+  simulation_results <- list()
+  
+  # Iterate over each row in the data
+  for (i in 1:nrow(data)) {
+    
+    # Extract values for the current component from the data table
+    alpha_mean <- abs(data$alpha[i])  # Ensure alpha is positive
+    alpha_sd <- data$sd_alpha[i]
+    n_mean <- data$npar[i]
+    n_sd <- data$sd_npar[i]
+    theta_r_mean <- data$theta_r[i]
+    theta_r_sd <- data$sd_theta_r[i]
+    theta_s_mean <- data$theta_s[i]
+    theta_s_sd <- data$sd_theta_s[i]
+    
+    # If there are NA values, skip that row
+    if (is.na(alpha_mean) | is.na(n_mean) | is.na(theta_r_mean) | is.na(theta_s_mean)) {
+      next
+    }
+    
+    # Generate random samples of the van Genuchten parameters based on their uncertainties
+    set.seed(123) # For reproducibility
+    alpha_samples <- rnorm(n_simulations, mean = alpha_mean, sd = alpha_sd)
+    n_samples <- rnorm(n_simulations, mean = n_mean, sd = n_sd)
+    theta_r_samples <- rnorm(n_simulations, mean = theta_r_mean, sd = theta_r_sd)
+    theta_s_samples <- rnorm(n_simulations, mean = theta_s_mean, sd = theta_s_sd)
+    
+    # Convert matric potentials from kPa to cmH2O (1 kPa = 10.19716 cmH2O)
+    h_fc <- abs(-33 * 10.19716)    # Field capacity matric potential in cmH2O
+    h_pwp <- abs(-1500 * 10.19716) # Permanent wilting point matric potential in cmH2O
+    
+    # Create a data frame for the sampled parameters
+    results <- data.frame(
+      alpha = alpha_samples,
+      n = n_samples,
+      theta_r = theta_r_samples,
+      theta_s = theta_s_samples
+    )
+    
+    # Calculate water retention at FC and PWP for each set of sampled parameters
+    results <- results %>%
+      rowwise() %>%
+      mutate(
+        theta_fc = van_genuchten(h_fc, alpha, n, theta_r, theta_s),
+        theta_pwp = van_genuchten(h_pwp, alpha, n, theta_r, theta_s)
+      ) %>%
+      ungroup()
+    
+    # Calculate AWHC (Available Water Holding Capacity) as the difference between FC and PWP
+    results$AWHC <- results$theta_fc - results$theta_pwp
+    
+    # Store results with component name and horizon name
+    simulation_results[[paste(data$compname[i], data$hzname[i], sep = "_")]] <- results
+  }
+  
+  return(simulation_results)
+}
+
+# Example Usage:
+
+# Define the input data (assuming the provided table is in 'data_table')
+data_table <- data.frame(
+  compname = c("Cowee", "Cowee", "Cowee", "Evard", "Evard", "Evard", "Evard"),
+  hzname = c("A", "Bt", "Cr", "A", "Bt", "BC", "C"),
+  alpha = c(-1.842475, -1.730537, NA, -1.645542, -1.366125, -1.424612, -1.418398),
+  npar = c(0.1358234, 0.1138021, NA, 0.1323788, 0.1204109, 0.1326414, 0.1358487),
+  theta_r = c(0.0408690, 0.0621608, NA, 0.0347270, 0.0812008, 0.0427608, 0.0346130),
+  theta_s = c(0.3990396, 0.4037475, NA, 0.3975404, 0.3914246, 0.3774418, 0.3639316),
+  sd_alpha = c(0.0620053, 0.0627735, NA, 0.0642499, 0.0808692, 0.0526431, 0.0440467),
+  sd_npar = c(0.0119609, 0.0093877, NA, 0.0119074, 0.0068510, 0.0068445, 0.0065309),
+  sd_theta_r = c(0.0035399, 0.0066552, NA, 0.0045635, 0.0129152, 0.0057733, 0.0046912),
+  sd_theta_s = c(0.0085277, 0.0075515, NA, 0.0095602, 0.0069737, 0.0056837, 0.0052443)
+)
+
+# Run the simulation function on the input data
+simulation_results <- calculate_water_retention(data_table)
+simulation_results <- simulate_vg_aws(data_table, n_simulations = 1000)
+# Check the output for the first component
+head(simulation_results[["Cowee_A"]])
+
+
+
+VG_params <- data.frame(
+  theta_r = 0.05,
+  theta_s = 0.4,
+  alpha = log10(0.08),  # log-transformed
+  npar = log10(1.2)     # log-transformed
+  )
+```
+
+### Explanation:
+
+1. **Van Genuchten Function**: The `van_genuchten` function calculates the water retention for a given matric potential \(h\), based on the van Genuchten parameters.
+  
+2. **Uncertainty Simulation**: We simulate multiple realizations of the van Genuchten parameters (\(\alpha\), \(n\), \(\theta_r\), and \(\theta_s\)) using `rnorm()`, which generates random values from a normal distribution based on the mean and standard deviation provided by ROSETTA3.
+
+3. **Field Capacity and PWP**: We then use the van Genuchten function to calculate the water retention at field capacity (\(h = -33\)) and permanent wilting point (\(h = -1500\)) for each set of simulated parameters.
+
+4. **Uncertainty Summaries**: Finally, the code summarizes the results by calculating the mean, standard deviation, and 95% confidence intervals for water retention at both FC and PWP.
+
+### Output:
+The output provides the mean soil water retention at field capacity and PWP, along with uncertainty estimates (standard deviations and confidence intervals) derived from the ROSETTA3 parameter uncertainties.

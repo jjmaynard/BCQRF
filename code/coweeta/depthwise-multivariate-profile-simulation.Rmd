@@ -1,0 +1,665 @@
+---
+title: "Untitled"
+output: html_document
+date: "2024-10-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+### Process:
+1. **Initial Multivariate Simulations**:
+   - You simulate each depth's soil properties (e.g., sand, silt, clay, bulk density, etc.) independently for each horizon using the `simulate_correlated_triangular` function. This ensures that the initial properties are correlated within the horizon but not necessarily across depths.
+   
+2. **Apply Depth-Wise Adjustments**:
+   - After simulating the properties at each depth, you apply the **depth-wise adjustment** using a **Gaussian Process (GP) model** to maintain the relationship between the horizons across the depth profile. This ensures that properties like sand content follow a realistic depth-wise trend.
+
+<!-- 3. **Reapply Cholesky Decomposition**: -->
+<!--    - After adjusting the depth-wise correlation structure, you might want to ensure that the **between-property correlations** (e.g., sand vs. silt vs. clay) are still preserved within each horizon. At this point, you can reapply **Cholesky decomposition** to reintroduce the correlations between the properties, ensuring they conform to a given correlation matrix. -->
+
+### Process Overview:
+1. **Simulate initial properties** at each depth using triangular distributions and Cholesky decomposition.
+2. **Adjust the properties depth-wise** using the `adjust_depthwise_property_by_depth` function.
+<!-- 3. **Reapply Cholesky decomposition** to adjust the between-property correlations within each depth (horizon). -->
+
+```{r}
+library(DiceKriging)
+library(kernlab)
+library(ggplot2)
+library(dplyr)
+library(compositions)
+```
+
+# Soil Profile Simulation
+
+```{r}
+# Function to simulate correlated triangular samples (as previously defined)
+simulate_correlated_triangular <- function(n, params, correlation_matrix, random_seed = NULL) {
+  if (!is.null(random_seed)) {
+    set.seed(random_seed)
+  }
+  
+  # Generate uncorrelated standard normal variables
+  uncorrelated_normal <- MASS::mvrnorm(n, mu = rep(0, length(params)), Sigma = diag(length(params)))
+  
+  # Cholesky decomposition of the correlation matrix
+  L <- chol(correlation_matrix)
+  
+  # Compute correlated normal variables by multiplying the uncorrelated normals with L
+  correlated_normal <- uncorrelated_normal %*% L
+  
+  # Initialize a matrix to store the samples for each triangular distribution
+  samples <- matrix(NA, nrow = n, ncol = length(params))
+  
+  # Loop through each triangular distribution
+  for (i in seq_along(params)) {
+    a <- params[[i]][1]  # Lower limit of the triangle distribution
+    b <- params[[i]][2]  # Mode (peak) of the triangle distribution
+    c <- params[[i]][3]  # Upper limit of the triangle distribution
+    
+    # Get the correlated normal variable for this triangular distribution
+    normal_var <- correlated_normal[, i]
+    
+    # Transform the normal variable to a uniform distribution using the CDF of the normal distribution
+    u <- pnorm(normal_var)
+    
+    # Handle the case of division by zero for degenerate triangular distributions
+    if (c == a) {
+      samples[, i] <- rep(a, n)
+    } else {
+      # Calculate samples for the triangular distribution
+      condition <- u <= (b - a) / (c - a)
+      
+      # For values satisfying the condition (left side of the triangle)
+      samples[condition, i] <- a + sqrt(u[condition] * (c - a) * (b - a))
+      
+      # For values not satisfying the condition (right side of the triangle)
+      samples[!condition, i] <- c - sqrt((1 - u[!condition]) * (c - a) * (c - b))
+    }
+  }
+  
+  return(samples)
+}
+
+
+# Example SSURGO data structure for multiple depths
+ssurgo_data <- data.frame(
+  depth = seq(0, 100, by = 10),  # Depth in cm
+  totalclay_l = c(15, 17, 20, 22, 24, 26, 28, 29, 30, 31, 32),  # Min clay content
+  totalclay_r = c(20, 21, 23, 25, 27, 28, 30, 31, 32, 33, 34),  # Representative clay content (mode)
+  totalclay_h = c(25, 26, 28, 29, 30, 31, 32, 33, 34, 35, 36),  # Max clay content
+  totalsand_l = c(55, 53, 50, 48, 46, 44, 42, 40, 38, 36, 35),  # Min sand content
+  totalsand_r = c(50, 48, 45, 43, 41, 39, 37, 35, 34, 33, 32),  # Representative sand content
+  totalsand_h = c(45, 44, 42, 40, 38, 36, 35, 33, 32, 31, 30),  # Max sand content
+  totalsilt_l = c(20, 21, 25, 28, 30, 32, 35, 36, 37, 38, 40),  # Min silt content
+  totalsilt_r = c(30, 31, 33, 35, 36, 38, 39, 40, 41, 42, 43),  # Representative silt content
+  totalsilt_h = c(40, 42, 45, 48, 50, 52, 54, 55, 56, 57, 58)   # Max silt content
+)
+ssurgo_data$depth_norm <- normalize(ssurgo_data$depth)
+# Example correlation matrix for sand, silt, and clay
+texture_correlation_matrix <- matrix(
+  c(1.0000000, -0.76231798, -0.67370589,
+    -0.7623180, 1.00000000, 0.03617498,
+    -0.6737059, 0.03617498, 1.00000000),
+  nrow = 3, byrow = TRUE
+)
+
+
+# List to store the simulated data
+sim_data_out <- list()
+
+# Simulate data for each depth in ssurgo_data
+n_simulations <- 100  # Define the number of simulations
+for (index in seq_len(nrow(ssurgo_data))) {
+  row <- ssurgo_data[index, ]
+  
+  # Step 2a: Define the parameters for triangular distributions for sand, silt, and clay
+  params_txt <- list(
+    c(row$totalsand_l, row$totalsand_r, row$totalsand_h),  # Sand
+    c(row$totalsilt_l, row$totalsilt_r, row$totalsilt_h),  # Silt
+    c(row$totalclay_l, row$totalclay_r, row$totalclay_h)   # Clay
+  )
+  
+  # Step 2b: Simulate sand, silt, and clay percentages with the correlation matrix
+  simulated_txt <- simulate_correlated_triangular(n_simulations, params_txt, texture_correlation_matrix)
+  
+  # Step 2c: Convert simulated data to compositional data using `acomp`
+  simulated_composition <- acomp(simulated_txt)
+  
+  # Step 2d: Include the depth for the current horizon in the compositional data
+  simulated_depth <- rep(row$depth, n_simulations)
+  
+  # Combine the depth and simulated compositional data into one data frame
+  simulated_with_depth <- data.frame(
+    depth = simulated_depth,
+    sand = simulated_composition[, 1],
+    silt = simulated_composition[, 2],
+    clay = simulated_composition[, 3]
+  )
+  
+  # Store the simulated data with depth in the list
+  sim_data_out[[index]] <- simulated_with_depth
+}
+
+# Combine all the simulated data into a single data frame
+simulated_combined <- do.call(rbind, sim_data_out)
+
+# Normalize the depth values (if not already normalized)
+simulated_combined$depth_norm <- normalize(simulated_combined$depth)
+
+# Number of depths
+n_depths <- length(unique(simulated_combined$depth))
+
+# Calculate the correct number of simulations based on the total number of rows
+n_simulations <- nrow(simulated_combined) / n_depths  # Total rows / Number of depths
+
+# Step 1: Extract clay and sand columns from the simulated_compositional data
+simulated_clay <- simulated_combined$clay  # Extract clay
+simulated_sand <- simulated_combined$sand  # Extract sand
+
+```
+
+
+# Depth-wise adjustment of soil property simulations using Gaussian Process modeling 
+
+```{r}
+#' Adjust Depthwise Property Values Using GP Predictions
+#'
+#' This function adjusts simulated property values across different depths to align with the relative changes predicted by a Gaussian Process (GP) model. The adjustment ensures that the simulated values reflect the trends indicated by the GP model while maintaining their statistical properties.
+#'
+#' @param simulated_values A numeric matrix of simulated property values, where each row corresponds to a depth and each column corresponds to a simulation.
+#' @param gp_model A fitted Gaussian Process model used to predict property means at different depths.
+#' @param depths A numeric vector of depth values corresponding to the rows of `simulated_values`.
+#'
+#' @return A numeric matrix of adjusted simulated property values with the same dimensions as `simulated_values`.
+#'
+#' @examples
+#' # Assuming 'simulated_values' is your matrix of simulated data,
+#' # 'gp_model' is your fitted GP model, and 'depths' is your depth vector:
+#' adjusted_values <- adjust_depthwise_property_GP_Quant(simulated_values, gp_model, depths)
+#'
+#' @export
+adjust_depthwise_property_GP_Quant <- function(simulated_values, gp_model, depths) {
+  
+  # Get GP-predicted means for each depth
+  gp_pred_means <- predict.GP(gp_model, newdata = as.matrix(depths))$Y_hat
+  
+  # Initialize adjusted values matrix with the original simulated values
+  adjusted_values <- simulated_values
+  
+  # Loop through each depth starting from the second one
+  for (i in 2:length(depths)) {
+    
+    # Extract simulated values at the previous and current depths
+    simulated_prev <- adjusted_values[i - 1, ]
+    simulated_curr <- adjusted_values[i, ]
+    
+    # Compute the empirical cumulative distribution function (ECDF) of the previous depth's simulated values
+    prev_ecdf <- ecdf(simulated_prev)
+    prev_quantiles <- prev_ecdf(simulated_prev)
+    
+    # Calculate the ratio of GP-predicted means between current and previous depths
+    gp_mean_ratio <- gp_pred_means[i] / gp_pred_means[i - 1]
+    
+    # Calculate the standard deviation adjustment factor
+    sd_adjustment_factor <- sd(simulated_curr) / sd(simulated_prev)
+    
+    # Initialize a vector to store adjusted simulated values for the current depth
+    adjusted_curr <- numeric(length(simulated_curr))
+    
+    # Adjust each simulated value at the current depth
+    for (j in 1:length(simulated_curr)) {
+      # Get the quantile for the simulated value at the previous depth
+      q <- prev_quantiles[j]
+      
+      # Find the corresponding value at the same quantile in the current depth's distribution
+      quantile_value <- quantile(simulated_curr, probs = q)
+      
+      # Adjust the current value based on the GP mean ratio and SD adjustment factor
+      adjusted_curr[j] <- quantile_value + (simulated_prev[j] * gp_mean_ratio - quantile_value) * sd_adjustment_factor
+    }
+    
+    # Store the adjusted simulated values back into the matrix
+    adjusted_values[i, ] <- adjusted_curr
+  }
+  
+  # Return the matrix of adjusted simulated values
+  return(adjusted_values)
+}
+
+
+
+
+
+# Step 2: Reshape the data into depth-wise matrices
+# Reshape clay data into a matrix where each row is a depth and each column is a simulation
+simulated_clay_matrix <- matrix(simulated_clay, nrow = n_depths, ncol = n_simulations, byrow = TRUE)
+
+depths <- seq(0, 1, by = 0.1)
+# Compute the mean values at each depth
+mean_clay <- rowMeans(simulated_clay_matrix)
+
+
+# Fit a GP model using the mean values
+gp_model <- GP_fit(X = as.matrix(depths), Y = mean_clay)
+
+# Get GP-predicted means for all depths
+gp_pred_means <- predict.GP(gp_model, newdata = as.matrix(depths))$Y_hat
+gp_pred_sd <- sqrt(predict.GP(gp_model, newdata = as.matrix(depths))$MSE)
+simulated_clay_adjust <- adjust_depthwise_property_GP_Quant(simulated_clay_matrix, gp_model, depths)
+
+# depth-wise property mean and sd
+mean_clay_adj <- rowMeans(simulated_clay_adjust)
+sd_clay_adj <- apply(simulated_clay_adjust, 1, sd)
+sd_clay <- apply(simulated_clay_matrix, 1, sd)
+# Reshape the adjusted matrix to long format for ggplot2
+simulated_clay_adjust_long <- melt(simulated_clay_adjust)
+simulated_clay_adjust_long$depth <- rep(seq(0, 100, by = 10), times = ncol(simulated_clay_adjust))
+colnames(simulated_clay_adjust_long) <- c("variable", "simulation", "clay", "depth")
+
+simulated_clay_long <- melt(simulated_clay_matrix)
+simulated_clay_long$depth <- rep(seq(0, 100, by = 10), times = ncol(simulated_clay_matrix))
+colnames(simulated_clay_long) <- c("variable", "simulation", "clay", "depth")
+
+# Combine the predicted GP means with the depth for plotting
+gp_pred_data <- data.frame(
+  depth = seq(0, 100, by = 10),
+  clay = gp_pred_means
+)
+
+
+# Load required libraries
+library(ggplot2)
+
+# Refined plot for better axis visibility and text positioning
+plot <- ggplot() +
+  # Plot the mean GP predictions as a line
+  geom_line(aes(x = gp_pred_means, y = depths * 100), color = 'red', size = 1.5) +
+  
+  # Add a ribbon to represent the variability of GP model predictions
+  geom_ribbon(aes(xmin = gp_pred_means - 1.96 * sd_clay, 
+                  xmax = gp_pred_means + 1.96 * sd_clay, 
+                  y = depths * 100), 
+              fill = 'red', alpha = 0.15) +  # Lighter ribbon
+  
+  # Plot the adjusted simulated data points
+  geom_point(data = simulated_clay_adjust_long, aes(x = clay, y = depth), 
+             color = "blue", alpha = 0.6, size = 2) +
+  
+  # Labels and formatting
+  labs(title = "Gaussian Process Prediction for Clay Content by Depth",
+       x = "Clay Content (%)", y = "Depth (cm)") +
+  
+  # Reverse y-axis to have depth increasing downward
+  scale_y_reverse() +
+  
+  # Add axis lines and make axis text visible
+  theme_minimal(base_size = 14) +
+  theme(panel.grid = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.text = element_text(color = "black")) +
+  
+  # Move the GP Predictions text to the right
+  annotate("text", x = max(mean_clay_adj), y = 0, label = "GP Predictions", color = "red", hjust = 0, size = 5) +
+  
+  # Move the Simulated Data text to the left
+  annotate("text", x = min(mean_clay_adj), y = max(depths * 100), label = "Simulated Data", color = "blue", hjust = 1, size = 5)
+
+# Save the final plot with improved appearance
+ggsave("clay_content_prediction_refined.png", plot = plot, 
+       width = 8, height = 6, units = "in", dpi = 300)
+
+
+
+
+```
+
+
+
+
+### Code for Reapplying Cholesky Decomposition:
+
+```{r}
+readjust_between_property_correlations <- function(adjusted_properties, correlation_matrix) {
+  #'
+  #' This function adjusts the between-property correlations for each depth/horizon
+  #' after depth-wise adjustments using Cholesky decomposition. It assumes that
+  #' the properties are already adjusted for depth-wise trends and now need to
+  #' conform to a specific correlation matrix within each horizon.
+  #'
+  #' @param adjusted_properties A matrix of properties that have been depth-adjusted.
+  #'        Each row is a horizon, and each column is a property (e.g., sand, silt, clay).
+  #' @param correlation_matrix A square matrix specifying the desired correlations between
+  #'        the variables (e.g., sand, silt, clay, bulk density, etc.). It must be positive
+  #'        semi-definite and of size equal to the number of properties (columns).
+  #'
+  #' @return A matrix of adjusted properties with the desired between-property correlations.
+
+  # Check if the correlation matrix is positive semi-definite
+  if (!isSymmetric(correlation_matrix) || any(eigen(correlation_matrix)$values < 0)) {
+    stop("Correlation matrix must be symmetric and positive semi-definite.")
+  }
+
+  # Cholesky decomposition of the correlation matrix
+  L <- chol(correlation_matrix)
+
+  # Generate correlated normal variables based on the adjusted properties
+  n <- nrow(adjusted_properties)
+  uncorrelated_normal <- MASS::mvrnorm(n, mu = rep(0, ncol(adjusted_properties)), Sigma = diag(ncol(adjusted_properties)))
+
+  # Compute the correlated normal variables by multiplying with L
+  correlated_normal <- uncorrelated_normal %*% L
+
+  # Adjust each property's distribution using the cumulative distribution function (CDF)
+  for (i in seq_len(ncol(adjusted_properties))) {
+    # Use the CDF of the adjusted properties to match the new correlated normal variables
+    u <- pnorm(correlated_normal[, i])
+    
+    # Re-map the correlated normal variable to the adjusted property range
+    adjusted_properties[, i] <- quantile(adjusted_properties[, i], u)
+  }
+
+  # Return the re-adjusted properties matrix
+  return(adjusted_properties)
+}
+
+# Example of applying this function to the adjusted properties
+# Assume 'adjusted_properties' is a matrix of sand, silt, clay that has already been adjusted depth-wise
+correlation_matrix <- matrix(c(1, 0.5, 0.3, 
+                               0.5, 1, 0.2, 
+                               0.3, 0.2, 1), nrow = 3)
+
+# Re-adjust the between-property correlations
+final_adjusted_properties <- readjust_between_property_correlations(adjusted_properties, correlation_matrix)
+
+# Print the re-adjusted properties
+print(final_adjusted_properties)
+```
+
+### Explanation of the Code:
+
+1. **Cholesky Decomposition**: We apply the Cholesky decomposition of the provided **correlation matrix**. This allows us to induce the desired correlations between the properties.
+   
+2. **Uncorrelated Normal Variables**: We generate uncorrelated normal variables (from a standard normal distribution) to be transformed into the desired correlations.
+
+3. **Re-Mapping**:
+   - The newly correlated normal variables are transformed into the desired property distributions by using their **empirical CDF** (from the `pnorm` function) and then re-mapped to match the adjusted property distributions.
+   
+4. **Re-adjust Properties**: After transforming the properties back into their original triangular distribution ranges, you’ll have **properties with both depth-wise trends and between-property correlations** that conform to the correlation matrix.
+
+### Why Reapply Cholesky After Depth Adjustments?
+
+- **Depth-wise Adjustments** may disrupt the correlations between properties within a horizon (e.g., sand vs. clay). Reapplying Cholesky decomposition ensures that after you adjust for the depth-wise relationship, the **between-property correlations** are still properly represented.
+  
+- This ensures that both **within-horizon correlations** and **depth-wise trends** are preserved.
+
+### Notes:
+- You can adjust the correlation matrix for different horizons if necessary (e.g., the sand-clay correlation might differ by depth).
+- Always verify that the **correlation matrix is positive semi-definite** before applying Cholesky decomposition (you could also use `nearPD()` from the `Matrix` package to adjust if necessary).
+
+This approach gives you flexibility to simulate both **within-horizon and across-horizon** soil property relationships while using both **triangular distributions** and **Gaussian Process models** for depth-wise trends.
+
+```{r}
+
+library(MASS)
+library(gpfit)
+library(tidyverse)
+
+```
+
+```{r}
+simulate_horizon_instances <- function(mu, cov_matrix, n_instances = 100) {
+  # Simulate multivariate instances for each horizon
+  mvrnorm(n = n_instances, mu = mu, Sigma = cov_matrix)
+}
+
+fit_gaussian_process <- function(depths, properties) {
+  # Fit a Gaussian Process model for soil properties across depths
+  gp_fit <- GP_fit(X = depths, Y = properties)
+  return(gp_fit)
+}
+
+# Function to predict using a fitted GP model
+predict_gp <- function(gp_fit, new_depths) {
+  pred <- predict(gp_fit, newdata = new_depths)
+  return(pred$Y_hat)  # Predicted values for new depths
+}
+
+calc_mahalanobis_distance <- function(horizon_instance, next_horizon_instances, cov_matrix) {
+  # Calculate Mahalanobis distances between horizon instance and the next horizon instances
+  apply(next_horizon_instances, 1, function(x) {
+    mahalanobis(x, horizon_instance, cov_matrix)
+  })
+}
+
+best_matching_instance <- function(current_horizon_instance, next_horizon_instances, cov_matrix) {
+  # Find the best matching instance in the next horizon based on Mahalanobis distance
+  distances <- calc_mahalanobis_distance(current_horizon_instance, next_horizon_instances, cov_matrix)
+  best_index <- which.min(distances)
+  return(next_horizon_instances[best_index, ])
+}
+
+simulate_full_profile <- function(profile_data, depth_column, n_instances = 100) {
+  
+  # Extract depths and soil properties from the input profile data
+  depths <- profile_data[[depth_column]]
+  n_horizons <- length(depths)
+  
+  # Initialize list to store simulated instances for each horizon
+  simulated_horizons <- list()
+  
+  # Iterate through each horizon and simulate instances
+  for (i in seq_len(n_horizons)) {
+    horizon <- profile_data[i, ]
+    
+    # Define mean vector and covariance matrix for the current horizon
+    mu <- c(horizon$sandtotal_r, horizon$silttotal_r, horizon$claytotal_r)  # Example: sand, silt, clay
+    cov_matrix <- matrix(c(100, -30, -20, -30, 50, 15, -20, 15, 40), nrow = 3)  # Define covariance matrix
+    
+    # Simulate instances for this horizon
+    horizon_instances <- simulate_horizon_instances(mu, cov_matrix, n_instances)
+    
+    # Fit a Gaussian Process model between this horizon and the previous one, if applicable
+    if (i > 1) {
+      # Predict the properties of the current horizon using a Gaussian Process based on the previous horizon
+      previous_depth <- profile_data[[depth_column]][i - 1]
+      current_depth <- profile_data[[depth_column]][i]
+      
+      gp_fit <- fit_gaussian_process(previous_depth, simulated_horizons[[i - 1]])
+      predicted_horizon_properties <- predict_gp(gp_fit, current_depth)
+      
+      # Find the best matching instance in the current horizon based on the GP model
+      best_instance <- best_matching_instance(predicted_horizon_properties, horizon_instances, cov_matrix)
+      simulated_horizons[[i]] <- best_instance
+    } else {
+      # For the first horizon, there is no previous horizon to condition on
+      simulated_horizons[[i]] <- horizon_instances[1, ]  # Select the first instance arbitrarily
+    }
+  }
+  
+  # Combine the simulated horizons into a data frame
+  simulated_profile <- do.call(rbind, simulated_horizons)
+  return(simulated_profile)
+}
+
+
+```
+
+```{r}
+# Example soil profile data (you would replace this with your actual data)
+profile_data <- data.frame(
+  hzdept_r = c(0, 20, 40, 60, 80, 100),  # Depths in cm
+  sandtotal_r = c(45, 42, 40, 35, 30, 25),  # Sand content in each horizon
+  silttotal_r = c(30, 32, 35, 38, 40, 42),  # Silt content in each horizon
+  claytotal_r = c(25, 26, 25, 27, 30, 33)   # Clay content in each horizon
+)
+profile_data$hzdept_r <- normalize(profile_data$hzdept_r)
+
+# Simulate the soil profile
+simulated_profile <- simulate_full_profile(profile_data, "hzdept_r", n_instances = 100)
+
+# View the simulated profile
+print(simulated_profile)
+
+depth_column= "hzdept_r"
+# Extract depths and soil properties from the input profile data
+  depths <- profile_data[[depth_column]]
+  n_horizons <- length(depths)
+  
+  # Initialize list to store simulated instances for each horizon
+  simulated_horizons <- list()
+  
+  # Iterate through each horizon and simulate instances
+  for (i in seq_len(n_horizons)) {
+    horizon <- profile_data[i, ]
+    
+    # Define mean vector and covariance matrix for the current horizon
+    mu <- c(horizon$sandtotal_r, horizon$silttotal_r, horizon$claytotal_r)  # Example: sand, silt, clay
+    cov_matrix <- matrix(c(100, -30, -20, -30, 50, 15, -20, 15, 40), nrow = 3)  # Define covariance matrix
+    
+    # Simulate instances for this horizon
+    horizon_instances <- simulate_horizon_instances(mu, cov_matrix, n_instances)
+    
+    # Fit a Gaussian Process model between this horizon and the previous one, if applicable
+    if (i > 1) {
+      # Predict the properties of the current horizon using a Gaussian Process based on the previous horizon
+      previous_depth <- profile_data[[depth_column]][i - 1]
+      current_depth <- profile_data[[depth_column]][i]
+      
+      gp_fit <- fit_gaussian_process(previous_depth, simulated_horizons[[i - 1]])
+      predicted_horizon_properties <- predict_gp(gp_fit, current_depth)
+      
+      # Find the best matching instance in the current horizon based on the GP model
+      best_instance <- best_matching_instance(predicted_horizon_properties, horizon_instances, cov_matrix)
+      simulated_horizons[[i]] <- best_instance
+    } else {
+      # For the first horizon, there is no previous horizon to condition on
+      simulated_horizons[[i]] <- horizon_instances[1, ]  # Select the first instance arbitrarily
+    }
+  }
+  
+  # Combine the simulated horizons into a data frame
+  simulated_profile <- do.call(rbind, simulated_horizons)
+```
+
+
+```{r}
+# Simulate data for the surface horizon
+mu_surface <- c(45, 30, 25)  # Mean values for sand, silt, clay
+cov_surface <- matrix(c(100, -30, -20, -30, 50, 15, -20, 15, 40), nrow = 3)  # Covariance matrix for surface
+
+# Simulate data for the second horizon
+mu_subsurface <- c(40, 35, 25)  # Mean values for sand, silt, clay
+cov_subsurface <- matrix(c(80, -25, -15, -25, 45, 10, -15, 10, 30), nrow = 3)  # Covariance for subsurface
+
+# Generate 100 instances for each horizon using multivariate normal
+sim_surface <- simulate_horizon_instances(mu_surface, cov_surface, n_instances = 100)
+sim_subsurface <- simulate_horizon_instances(mu_subsurface, cov_subsurface, n_instances = 100)
+
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r}
+# Example depths for multiple horizons
+depths <- c(0, 20, 40)  # Surface at 0 cm, subsurface at 20 cm, deeper horizon at 40 cm
+
+# Rescale depths to the range (0, 1)
+depths_scaled <- (depths - min(depths)) / (max(depths) - min(depths))
+
+# Simulate data for the horizons (e.g., sand content)
+mu_surface <- c(45, 30, 25)  # Mean values for sand, silt, clay in surface horizon
+cov_surface <- matrix(c(100, -30, -20, -30, 50, 15, -20, 15, 40), nrow = 3)  # Covariance matrix for surface
+sim_surface <- simulate_horizon_instances(mu_surface, cov_surface, n_instances = 100)
+
+# Fit a Gaussian Process for the first property (e.g., sand content) across multiple depths
+gp_fit <- GP_fit(X = as.matrix(depths_scaled), Y = sim_surface[, 1])  # Fit GP for sand content across depths
+
+# Predict the sand content for a new depth (e.g., 30 cm, which should be scaled first)
+new_depth <- 30
+new_depth_scaled <- (new_depth - min(depths)) / (max(depths) - min(depths))  # Rescale new depth
+predicted_value <- predict_gp(gp_fit, as.matrix(new_depth_scaled))
+
+# Print the predicted sand content at the new depth
+print(predicted_value)
+
+# Now, match the predicted subsurface horizon with the best-matching instance from the simulated subsurface horizon
+mu_subsurface <- c(40, 35, 25)  # Mean values for sand, silt, clay in subsurface horizon
+cov_subsurface <- matrix(c(80, -25, -15, -25, 45, 10, -15, 10, 30), nrow = 3)  # Covariance for subsurface
+sim_subsurface <- simulate_horizon_instances(mu_subsurface, cov_subsurface, n_instances = 100)
+
+# Find the best matching instance from the subsurface horizon
+best_subsurface_instance <- best_matching_instance(predicted_value, sim_subsurface, cov_subsurface)
+
+# Print the best-matching instance from the subsurface horizon
+print(best_subsurface_instance)
+
+
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r}
+simulate_full_profile <- function(profile_data, depth_column, n_instances = 100) {
+  
+  # Extract depths and soil properties from the input profile data
+  depths <- profile_data[[depth_column]]
+  depths <- normalize(depths)
+  n_horizons <- length(depths)
+  
+  # Initialize list to store simulated instances for each horizon
+  simulated_horizons <- list()
+  simulated_depths <- list()  # To store simulated depths
+
+  # Iterate through each horizon and simulate instances
+  for (i in seq_len(n_horizons)) {
+    horizon <- profile_data[i, ]
+    
+    # Define mean vector and covariance matrix for the current horizon
+    mu <- c(horizon$sandtotal_r, horizon$silttotal_r, horizon$claytotal_r)  # Example: sand, silt, clay
+    cov_matrix <- matrix(c(100, -30, -20, -30, 50, 15, -20, 15, 40), nrow = 3)  # Define covariance matrix
+    
+    # Simulate instances for this horizon
+    horizon_instances <- simulate_horizon_instances(mu, cov_matrix, n_instances)
+    
+    if (i == 1) {
+      # For the first horizon, simply select the first simulated instance
+      simulated_horizons[[i]] <- horizon_instances[1, ]  # Arbitrary selection for first horizon
+      simulated_depths[[i]] <- depths[i]  # Store the depth for GP fitting later
+    } else {
+      # Fit Gaussian Process using previous depths and simulated properties
+      previous_depths <- unlist(simulated_depths)  # All previous depths
+      previous_properties <- do.call(rbind, simulated_horizons)[, 1]  # Sand content as an example
+      
+      gp_fit <- fit_gaussian_process(previous_depths, previous_properties)  # Fit GP for previous depths/properties
+      
+      # Predict the properties of the current horizon using the GP model
+      current_depth <- depths[i]
+      predicted_property <- predict_gp(gp_fit, current_depth)
+      
+      # Find the best matching instance in the current horizon based on the GP prediction
+      best_instance <- best_matching_instance(predicted_property, horizon_instances, cov_matrix)
+      
+      # Store the selected instance and depth for use in the next iteration
+      simulated_horizons[[i]] <- best_instance
+      simulated_depths[[i]] <- current_depth
+    }
+  }
+  
+  # Combine the simulated horizons into a data frame
+  simulated_profile <- do.call(rbind, simulated_horizons)
+  return(simulated_profile)
+}
+
+# Example usage with a soil profile data frame (profile_data)
+# Assuming profile_data has columns for depth and soil properties like sandtotal_r, silttotal_r, and claytotal_r
+simulated_profile <- simulate_full_profile(profile_data, "hzdept_r", n_instances = 100)
+
+# View the simulated profile
+print(simulated_profile)
+
+```
+

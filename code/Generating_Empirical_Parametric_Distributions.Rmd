@@ -1,0 +1,1339 @@
+---
+title: "Code to simulate empirical and parametric distributions from statistical moments"
+output: html_notebook
+---
+
+
+
+```{r}
+#generate the empirical distribution using the min, max, mode, mean, sd, q25, q75, p10, and p90
+generate_empirical_distribution <- function(n, min_val, max_val, mode, mean, sd, q25, q75, p10, p90) {
+  # Create breakpoints
+  breakpoints <- c(min_val, p10, q25, mode, q75, p90, max_val)
+  
+  # Start with an initial guess for densities
+  mode_density <- 1
+  densities <- c(0, mode_density / 4, mode_density / 2, mode_density, mode_density / 2, mode_density / 4, 0)
+  
+  # Interpolate densities for sampling
+  interpolated_density <- approxfun(breakpoints, densities, method = "linear")
+  
+  # Adjust densities to match desired mean and sd
+  # This is a simple optimization procedure that adjusts densities at q25, mode, and q75
+  for(iter in 1:100) {
+    samples <- numeric(n)
+    for(i in 1:n) {
+      repeat {
+        x <- runif(1, min_val, max_val)
+        y <- runif(1, 0, mode_density)
+        if(y <= interpolated_density(x)) {
+          samples[i] <- x
+          break
+        }
+      }
+    }
+    
+    current_mean <- mean(samples)
+    current_sd <- sd(samples)
+    
+    # Adjust densities based on the deviation from desired mean and sd
+    if(current_mean < mean) {
+      densities[3] <- densities[3] * 1.05
+      densities[4] <- densities[4] * 1.05
+      densities[5] <- densities[5] * 1.05
+    } else {
+      densities[3] <- densities[3] * 0.95
+      densities[4] <- densities[4] * 0.95
+      densities[5] <- densities[5] * 0.95
+    }
+    
+    if(current_sd < sd) {
+      densities[3] <- densities[3] * 0.95
+      densities[5] <- densities[5] * 1.05
+    } else {
+      densities[3] <- densities[3] * 1.05
+      densities[5] <- densities[5] * 0.95
+    }
+    
+    interpolated_density <- approxfun(breakpoints, densities, method = "linear")
+  }
+  
+  return(samples)
+}
+
+# Test the function
+n <- 2000
+min_val <- 0
+max_val <- 10
+mode <- 5
+mean <- 5.5
+sd <- 2
+q25 <- 3
+q75 <- 8
+p10 <- 2
+p90 <- 9
+
+samples <- generate_empirical_distribution(n, min_val, max_val, mode, mean, sd, q25, q75, p10, p90)
+hist(samples, breaks = 50, main = "Empirical Distribution", xlab = "Value", ylab = "Frequency")
+hist(samples2, breaks = 50, main = "Empirical Distribution", xlab = "Value", ylab = "Frequency")
+
+mean(samples)
+mode(samples)
+quantile(samples, probs = c(.1, .25, .5, .75, .9))
+min(samples)
+max(samples)
+
+samples2 <- triangle_distribution(1000, min_val, mode, max_val)
+
+mean(samples2)
+mode(samples2)
+quantile(samples2, probs = c(.1, .25, .5, .75, .9))
+min(samples2)
+max(samples2)
+
+# revised version to includes all percentiles
+generate_empirical_distribution_all <- function(n, min_val, max_val, mean, sd, q25, q75, p10, p90, p20, p30, p40, p50, p60, p70, p80) {
+  # Create breakpoints without the mode
+  breakpoints <- c(min_val, p10, p20, q25, p30, p40, p50, p60, p70, q75, p80, p90, max_val)
+  
+  # Assume uniform initial density across the range
+  densities <- rep(1 / length(breakpoints), length(breakpoints))
+
+  # Interpolate densities for sampling
+  interpolated_density <- approxfun(breakpoints, densities, method = "linear")
+  
+  # Optimization procedure to adjust densities
+  for(iter in 1:100) {
+    samples <- numeric(n)
+    for(i in 1:n) {
+      repeat {
+        x <- runif(1, min_val, max_val)
+        y <- runif(1, 0, max(densities))
+        if(y <= interpolated_density(x)) {
+          samples[i] <- x
+          break
+        }
+      }
+    }
+    
+    current_mean <- mean(samples)
+    current_sd <- sd(samples)
+    
+    # Dynamically adjust densities based on deviation from desired mean and sd
+    if(current_mean < mean) {
+      densities <- densities * 1.05
+    } else {
+      densities <- densities * 0.95
+    }
+    
+    if(current_sd < sd) {
+      densities[1:length(densities)/2] <- densities[1:length(densities)/2] * 0.95
+      densities[(length(densities)/2 + 1):length(densities)] <- densities[(length(densities)/2 + 1):length(densities)] * 1.05
+    } else {
+      densities[1:length(densities)/2] <- densities[1:length(densities)/2] * 1.05
+      densities[(length(densities)/2 + 1):length(densities)] <- densities[(length(densities)/2 + 1):length(densities)] * 0.95
+    }
+    
+    interpolated_density <- approxfun(breakpoints, densities, method = "linear")
+  }
+  
+  return(samples)
+}
+
+generate_density_based_distribution <- function(Min, P10, P20, P30, P40, P50, P60, P70, P80, P90, Max, n = 1000, sample_size = 10000) {
+    # Extract quantiles and minimum/maximum values
+    quantiles <- c(Min, P10, P20, P30, P40, P50, P60, P70, P80, P90, Max)
+    quantiles <- na.omit(quantiles)  # Remove NA values
+    
+    # Remove invalid data (-1 values assumed to be invalid)
+    valid_indices <- quantiles != -1
+    quantiles <- quantiles[valid_indices]
+    
+    if (length(quantiles) <= 1) {
+        stop("Insufficient valid quantile data for density estimation.")
+    }
+    
+    # Simulate dense points around each quantile
+    dense_points <- numeric(0)
+    for (i in 1:length(quantiles)) {
+        sd <- ifelse(i == 1 || i == length(quantiles),
+                     abs(quantiles[i] - quantiles[min(length(quantiles), i+1)]) / 3,
+                     min(abs(quantiles[i] - quantiles[i-1]), abs(quantiles[i] - quantiles[i+1])) / 2)
+        sd <- max(sd, 0.1)
+        
+        lower <- ifelse(i == 1, Min, -Inf)
+        upper <- ifelse(i == length(quantiles), Max, Inf)
+        dense_points <- c(dense_points, truncnorm::rtruncnorm(sample_size / length(quantiles), a = lower, b = upper, mean = quantiles[i], sd = sd))
+    }
+    
+    if (any(is.na(dense_points))) {
+        stop("NA values encountered in dense point generation.")
+    }
+    
+    if (length(dense_points) == 0) {
+        stop("No dense points generated. Check input quantiles and density adjustments.")
+    }
+    
+    # Apply KDE to the simulated dense points
+    density_est <- density(dense_points, adjust = 1, kernel = "gaussian", n = sample_size)
+    
+    # Sample from the KDE
+    sampled_indices <- sample(length(density_est$x), n, replace = TRUE, prob = density_est$y)
+    samples <- density_est$x[sampled_indices]
+    
+    # Redistribute samples that are out of bounds
+    lower_bound_samples <- samples[samples <= Min]
+    upper_bound_samples <- samples[samples >= Max]
+    
+    if (length(lower_bound_samples) > 0) {
+        redistributed_lower <- runif(length(lower_bound_samples), Min, P10)
+        samples[samples <= Min] <- redistributed_lower
+    }
+    
+    if (length(upper_bound_samples) > 0) {
+        redistributed_upper <- runif(length(upper_bound_samples), P90, Max)
+        samples[samples >= Max] <- redistributed_upper
+    }
+    
+    return(samples)
+}
+
+# Install truncnorm if not already installed
+if (!require(truncnorm)) {
+    install.packages("truncnorm")
+    library(truncnorm)
+}
+
+```
+
+
+# Parametric distributions: Beta Distribution
+```{r}
+
+fit_beta_distribution <- function(min_val, max_val, mean, sd) {
+  # Rescale statistics to [0, 1]
+  scaled_mean <- (mean - min_val) / (max_val - min_val)
+  variance <- (sd / (max_val - min_val))^2
+  
+  # Estimate alpha and beta using method of moments
+  alpha <- ((1 - scaled_mean) / variance - 1 / scaled_mean) * scaled_mean^2
+  beta <- alpha * (1 / scaled_mean - 1)
+  
+  return(list(alpha = alpha, beta = beta))
+}
+
+simulate_from_beta <- function(n, min_val, max_val, mean, sd) {
+  params <- fit_beta_distribution(min_val, max_val, mean, sd)
+  simulated_data <- rbeta(n, params$alpha, params$beta)
+  
+  # Rescale data to [min_val, max_val]
+  rescaled_data <- min_val + simulated_data * (max_val - min_val)
+  return(rescaled_data)
+}
+
+# Test the function
+min_val <- 0
+max_val <- 10
+mean <- 5.5
+sd <- 2
+n <- 1000
+
+simulated_data <- simulate_from_beta(n, min_val, max_val, mean, sd)
+hist(simulated_data, breaks = 50, main = "Simulated Data from Beta Distribution", xlab = "Value")
+```
+
+
+#linear interpolation for the quantile function to model an empirical distribution based on the given quantiles
+```{r}
+percentiles <- c(0, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1)
+values <- c(min_val, p10, p20, p30, p40, p50, p60, p70, p80, p90, max_val)
+
+# Quantile function using linear interpolation
+q_empirical <- function(p) {
+  if (length(p) == 0) return(numeric(0))
+  approx(x = percentiles, y = values, xout = p)$y
+}
+
+# Test the empirical quantile function
+p_test <- seq(0, 1, by = 0.01)
+values_test <- sapply(p_test, q_empirical)
+
+
+# Define the quantile function using linear interpolation
+empirical_quantile_function <- function(p, percentiles, values) {
+  approx(x = percentiles, y = values, xout = p)$y
+}
+
+# Generate random samples from the empirical distribution
+simulate_from_empirical_quantiles <- function(n, percentiles, values) {
+  # Generate random probabilities
+  random_p <- runif(n)
+  
+  # Use the empirical quantile function to get values corresponding to these probabilities
+  sapply(random_p, function(p) empirical_quantile_function(p, percentiles, values))
+}
+
+# Define the percentiles and their corresponding values
+percentiles <- c(0, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1)
+values <- c(min_val, p10, p20, p30, p40, p50, p60, p70, p80, p90, max_val)
+
+# Simulate 1000 samples from the empirical distribution
+simulated_empirical_percentiles <- simulate_from_empirical_quantiles(1000, percentiles, values)
+
+percentiles <- quantile(simulated_empirical_percentiles, probs = c(0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90))
+print(percentiles)
+# You can replace min_value, P10_value, ..., max_value with the actual values you have for those percentiles.
+
+```
+
+# Test data from WISE30sec
+| Num0| Num|  Mean|   STD| CV| Median| MAD| Min| Max|    Var|FAO_90 | P10| P20| P30|  P40| P50|  P60|   P70|   P80|  P90| Quart1| Quart3|Cluster_ID    |   SE|
+|----:|---:|-----:|-----:|--:|------:|---:|---:|---:|------:|:------|---:|---:|---:|----:|---:|----:|-----:|-----:|----:|------:|------:|:-------------|----:|
+|   15|  15| 19.98| 17.67| 88|     12|  10|   1|  55| 312.32|-      | 1.6| 4.2| 6.6| 9.16|  12| 22.1| 31.55| 39.02| 50.2|      5|   35.1|ACfALSA/A/D1u | 4.56|
+```{r}
+
+# Test the function
+n <- 1000
+min_val <- 1
+max_val <- 55
+mode <- 
+mean <- 19.98
+sd <- 17.67
+q25 <- 5
+q75 <- 35.1
+p10 <- 1.6
+p20 <- 4.2
+p30 <- 6.6
+p40 <- 9.16
+p50 <- 12
+p60 <- 22.1
+p70 <- 31.55
+p80 <- 39.02
+p90 <- 50.2
+
+percentiles <- c(0, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1)
+values <- c(min_val, p10, p20, p30, p40, p50, p60, p70, p80, p90, max_val)
+
+simulated_empirical<- generate_empirical_distribution(n, min_val, max_val, mode, mean, sd, q25, q75, p10, p90)
+simulated_empirical_all<- generate_empirical_distribution_all(n, min_val, max_val, mean, sd, q25, q75, p10, p90, p20, p30, p40, p50, p60, p70, p80)
+simulated_density<- generate_density_based_distribution(Min=min_val, P10=p10, P20=p20, P30=p30, P40=p40, P50=p50, P60=p60, P70=p70, P80=p80, P90=p90, Max=max_val, n = 1000)
+simulated_empirical_quantiles <- simulate_from_empirical_quantiles(1000, percentiles, values)
+simulated_beta <- simulate_from_beta(n, min_val, max_val, mean, sd)
+simulated_triangle <- triangle_distribution(1000, min_val, mean, max_val)
+
+hist(simulated_empirical, breaks = 50, main = "Empirical Distribution", xlab = "Value", ylab = "Frequency")
+hist(simulated_empirical_all, breaks = 50, main = "Empirical Distribution", xlab = "Value", ylab = "Frequency")
+hist(simulated_density, breaks = 50, main = "Empirical Distribution", xlab = "Value", ylab = "Frequency")
+
+hist(simulated_empirical_quantiles, breaks = 50, main = "Empirical Distribution Percentiles", xlab = "Value", ylab = "Frequency")
+hist(simulated_beta, breaks = 50, main = "Simulated Data from Beta Distribution", xlab = "Value", ylab = "Frequency")
+hist(simulated_triangle, breaks = 50, main = "Simulated Data from Triangle Distribution", xlab = "Value", ylab = "Frequency")
+```
+```{r}
+calculate_summary_statistics <- function(data) {
+    # Ensure the input is a numeric vector
+    if (!is.numeric(data)) {
+        stop("Data must be a numeric vector.")
+    }
+  
+    # Calculating basic statistics
+    num <- length(data)
+    mean_value <- mean(data)
+    std_dev <- sd(data)
+    cv <- (std_dev / mean_value) * 100
+    median_value <- median(data)
+    mad_value <- mad(data)
+    min_value <- min(data)
+    max_value <- max(data)
+    variance_value <- var(data)
+    se <- sd(data) / sqrt(length(data))
+  
+    # Calculating percentiles and quartiles
+    percentiles <- quantile(data, probs = c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9))
+    quartiles <- quantile(data, probs = c(0.25, 0.75))
+    quart1 <- quartiles[1]
+    quart3 <- quartiles[2]
+
+    # Returning results as a data frame
+    summary_df <- data.frame(
+        Num = num,
+        Mean = mean_value,
+        STD = std_dev,
+        CV = cv,
+        Median = median_value,
+        MAD = mad_value,
+        Min = min_value,
+        Max = max_value,
+        Var = variance_value,
+        P10 = percentiles[1],
+        P20 = percentiles[2],
+        P30 = percentiles[3],
+        P40 = percentiles[4],
+        P50 = percentiles[5],
+        P60 = percentiles[6],
+        P70 = percentiles[7],
+        P80 = percentiles[8],
+        P90 = percentiles[9],
+        Quart1 = quart1,
+        Quart3 = quart3,
+        SE = se
+    )
+  
+    return(summary_df)
+}
+
+# Example usage
+
+simulated_empirical_statistics <- calculate_summary_statistics(simulated_empirical)
+simulated_empirical_statistics_all <- calculate_summary_statistics(simulated_empirical_all)
+simulated_density_statistics <- calculate_summary_statistics(simulated_density)
+print(simulated_density_statistics)
+
+```
+
+
+```{r}
+generate_empirical_distribution <- function(n, min_val, max_val, mean, sd, q25, q75, p10, p90) {
+  # Create breakpoints
+  breakpoints <- c(min_val, p10, q25, q75, p90, max_val)
+  
+  # Start with an initial guess for densities
+  densities <- c(0, 0.2, 0.6, 0.6, 0.2, 0)
+  
+  # Interpolate densities for sampling
+  interpolated_density <- approxfun(breakpoints, densities, method = "linear")
+  
+  # Adjust densities to match desired mean and sd
+  # This is a simple optimization procedure that adjusts densities at q25 and q75
+  for(iter in 1:100) {
+    samples <- numeric(n)
+    for(i in 1:n) {
+      repeat {
+        x <- runif(1, min_val, max_val)
+        y <- runif(1, 0, max(densities))
+        if(y <= interpolated_density(x)) {
+          samples[i] <- x
+          break
+        }
+      }
+    }
+    
+    current_mean <- mean(samples)
+    current_sd <- sd(samples)
+    
+    # Adjust densities based on the deviation from desired mean and sd
+    if(current_mean < mean) {
+      densities[3] <- densities[3] * 1.05
+      densities[4] <- densities[4] * 1.05
+    } else {
+      densities[3] <- densities[3] * 0.95
+      densities[4] <- densities[4] * 0.95
+    }
+    
+    if(current_sd < sd) {
+      densities[3] <- densities[3] * 0.95
+      densities[4] <- densities[4] * 1.05
+    } else {
+      densities[3] <- densities[3] * 1.05
+      densities[4] <- densities[4] * 0.95
+    }
+    
+    interpolated_density <- approxfun(breakpoints, densities, method = "linear")
+  }
+  
+  return(samples)
+}
+
+# # Test the function
+# n <- 1000
+# min_val <- 0
+# max_val <- 10
+# mean <- 5.5
+# sd <- 2
+# q25 <- 3
+# q75 <- 8
+# p10 <- 2
+# p90 <- 9
+
+samples <- generate_empirical_distribution(n=1000, min_val, max_val, mean, sd, q25, q75, p10, p90)
+hist(samples, breaks = 50, main = "Empirical Distribution", xlab = "Value", ylab = "Frequency")
+
+```
+
+# Run Test on WISE30sec data to see which simulation approach produces the best fit
+```{r}
+HW30s_p <- read.table("C:/R_Drive/Data_Files/LPKS_Data/Data/Global_Soil_Maps/wise_30sec_v1/Interchangeable_format/stat_ACCL1.txt", header=TRUE, sep=",")
+
+
+for(i in 1:nrow(HW30s_p)){
+      data <- HW30s_p[i,]
+      simulated_empirical<- generate_empirical_distribution(n=1000, min_val = data$Min, max_val = data$Max, mean = data$Mean, sd = data$STD, q25 = data$Quart1, q75 = data$Quart3, p10 = data$P10, p90 = data$P90)
+      simulated_empirical_quantiles <- simulate_from_empirical_quantiles(1000, percentiles, values)
+      simulated_beta <- simulate_from_beta(n, min_val, max_val, mean, sd)
+      simulated_triangle <- triangle_distribution(1000, min_val, mean, max_val)
+      
+}
+simulated_empirical<- generate_empirical_distribution(n, min_val, max_val, mean, sd, q25, q75, p10, p90)
+simulated_empirical_quantiles <- simulate_from_empirical_quantiles(1000, percentiles, values)
+simulated_beta <- simulate_from_beta(n, min_val, max_val, mean, sd)
+simulated_triangle <- triangle_distribution(1000, min_val, mean, max_val)
+
+
+```
+
+
+#metalog distribution
+```{r}
+library(stats)
+
+# Define the basis functions for the metalog
+metalog_basis <- function(y, n) {
+  switch(n,
+         '1' = log(y),
+         '2' = log(1 - y),
+         '3' = y * (1 - y) * log(y),
+         '4' = y * (1 - y) * log(1 - y),
+         '5' = y * (1 - y) * (log(y))^2,
+         '6' = y * (1 - y) * (log(1 - y))^2,
+         # Add more terms as necessary
+         stop("Term not defined")
+  )
+}
+
+# Function to fit metalog to quantile data
+fit_metalog <- function(p, y) {
+  # Create a matrix for the metalog basis functions
+  m <- matrix(, ncol = length(p), nrow = 11)
+  for (i in 1:11) {
+    m[,i] = sapply(y, metalog_basis, n = i)
+  }
+  
+  # Linear regression to determine coefficients
+  fit <- lm(y ~ m - 1)
+  return(fit$coefficients)
+}
+
+# Provide the quantile data
+p <- c(0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0, 1)
+y <- c( p10, p20, p30, p40, p50, p60, p70, p80, p90, min_val, max_val)
+
+# Fit the metalog
+coefficients <- fit_metalog(p, y)
+
+
+simulate_metalog <- function(n, coefficients) {
+  u <- runif(n)
+  y_simulated <- numeric(n)
+  
+  for (i in 1:n) {
+    y_val <- u[i]
+    for (j in 1:length(coefficients)) {
+      y_val <- y_val + coefficients[j] * metalog_basis(u[i], j)
+    }
+    y_simulated[i] <- y_val
+  }
+  return(y_simulated)
+}
+
+# Simulate 1000 values from the metalog distribution
+simulated_values <- simulate_metalog(1000, coefficients)
+
+```
+```{r}
+library(stats)
+
+# Define the basis functions for the metalog
+metalog_basis <- function(y, n) {
+  switch(n,
+         '1' = log(y),
+         '2' = log(1 - y),
+         '3' = y * (1 - y) * log(y),
+         '4' = y * (1 - y) * log(1 - y),
+         '5' = y * (1 - y) * (log(y))^2,
+         '6' = y * (1 - y) * (log(1 - y))^2,
+         '7' = y * (1 - y) * (log(y)) * (log(1 - y)),
+         '8' = y * (1 - y) * (log(y))^3,
+         '9' = y * (1 - y) * (log(1 - y))^3,
+         '10' = y * (1 - y) * (log(y))^2 * (log(1 - y)),
+         '11' = y * (1 - y) * log(y) * (log(1 - y))^2,
+         stop("Term not defined")
+  )
+}
+
+# Function to fit metalog to quantile data
+fit_metalog <- function(p, y) {
+  # Create a matrix for the metalog basis functions
+  m <- matrix(, ncol = length(p), nrow = 11)
+  for (i in 1:11) {
+    m[,i] = sapply(y, metalog_basis, n = i)
+  }
+  
+  # Linear regression to determine coefficients
+  fit <- lm(y ~ m - 1)
+  return(fit$coefficients)
+}
+
+# Provide the quantile data
+p <- c(0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0, 1)
+y <- c( p10, p20, p30, p40, p50, p60, p70, p80, p90, min_val, max_val)
+
+# Fit the metalog
+coefficients <- fit_metalog(p, y)
+
+# Simulate values from the metalog distribution
+simulate_metalog <- function(n, coefficients) {
+  u <- runif(n)
+  y_simulated <- numeric(n)
+  
+  for (i in 1:n) {
+    y_val <- u[i]
+    for (j in 1:length(coefficients)) {
+      y_val <- y_val + coefficients[j] * metalog_basis(u[i], j)
+    }
+    y_simulated[i] <- y_val
+  }
+  return(y_simulated)
+}
+
+# Simulate 1000 values from the metalog distribution
+simulated_values <- simulate_metalog(2000, coefficients)
+
+```
+
+```{r}
+# Load the rmetalog package
+library(rmetalog)
+
+# Provide the quantile data
+p <- c(0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90)
+y <- c(p10, p20, p30, p40, p50, p60, p70, p80, p90)
+
+# Set bounds using min and max values
+bounds <- c(min_val, max_val)
+
+# Fit the metalog distribution
+metalog_fit <- metalog(y, probs = p, bounds = bounds, boundedness = "b", term_limit = 9, step_len = 0.01)
+
+# Function to simulate values from the metalog distribution
+simulate_metalog_rmetalog <- function(metalog_fit, n) {
+  rmetalog(metalog_fit, n, term=9)
+}
+
+# Simulate 1000 values from the metalog distribution
+simulated_values_rmetalog2 <-  rmetalog(metalog_fit, n=1000, term=2)
+simulated_values_rmetalog9 <-  rmetalog(metalog_fit, n=1000, term=9)
+hist(simulated_values_rmetalog2, breaks = 50, main = "Metalog Distribution", xlab = "Value", ylab = "Frequency")
+hist(simulated_values_rmetalog9, breaks = 50, main = "Metalog Distribution", xlab = "Value", ylab = "Frequency")
+
+```
+
+
+```{r}
+# Define the basis functions for the metalog
+metalog_basis <- function(y, n) {
+  switch(n,
+         '1' = log(y),
+         '2' = log(1 - y),
+         '3' = y * (1 - y) * log(y),
+         '4' = y * (1 - y) * log(1 - y),
+         '5' = y * (1 - y) * (log(y))^2,
+         '6' = y * (1 - y) * (log(1 - y))^2,
+         '7' = y * (1 - y) * (log(y)) * (log(1 - y)),
+         '8' = y * (1 - y) * (log(y))^3,
+         '9' = y * (1 - y) * (log(1 - y))^3,
+         stop("Term not defined")
+  )
+}
+
+# Function to get quantile from metalog coefficients
+metalog_quantile <- function(p, coefficients) {
+  q_val <- 0
+  for (i in 1:length(coefficients)) {
+    q_val <- q_val + coefficients[i] * metalog_basis(p, i)
+  }
+  return(q_val)
+}
+
+
+# Function to simulate values from the bounded metalog distribution
+simulate_metalog_values <- function(coefficients, n=1000, lower_bound, upper_bound) {
+  term <- length(coefficients)
+  
+  x <- stats::runif(n)
+  Y <- data.frame(y1 = rep(1, n))
+  
+  # Construct initial Y Matrix values
+  Y$y2 <- (log(x / (1 - x)))
+  if (term > 2) {
+    Y$y3 <- (x - 0.5) * Y$y2
+  }
+  
+  if (term > 3) {
+    Y$y4 <- x - 0.5
+  }
+  
+  # Complete the values through the term limit
+  if (term > 4) {
+    for (i in 5:(term)) {
+      y <- paste0('y', i)
+      if (i %% 2 != 0) {
+        Y[[y]] <- Y$y4 ^ (i %/% 2)
+      }
+      if (i %% 2 == 0) {
+        z <- paste0('y', (i - 1))
+        Y[[y]] <- Y$y2 * Y[[z]]
+      }
+    }
+  }
+  
+  Y <- as.matrix(Y)
+
+  a <- as.matrix(coefficients)
+  s <- Y %*% a[1:term]
+  s <- (min_val + max_val * exp(s)) / (1 + exp(s))
+  return(as.numeric(s))
+}
+
+# Given coefficients
+term_num=3
+amat <- paste0('a', term_num)
+coefficients <- c(metalog_fit$A[[`amat`]])[metalog_fit$A[[`amat`]]!=0]   # Replace with your coefficients
+lower_bound <- min_val      # Replace with your lower bound
+upper_bound <- max_val      # Replace with your upper bound
+
+# Evaluate the quantile function at a specific probability
+p_value <- 0.5  # Example: median
+quantile_value <- metalog_quantile(p_value, coefficients)
+
+# Simulate 1000 values from the metalog distribution
+simulated_values_metalog <- simulate_metalog_values(coefficients, n=1000, lower_bound, upper_bound)
+hist(simulated_values_metalog, breaks = 50, main = "Metalog Distribution", xlab = "Value", ylab = "Frequency")
+```
+
+```{r}
+
+simulate_metalog_values <- function(coefficients, n=1000, min, max) {
+  term <- length(coefficients)
+  
+  x <- stats::runif(n)
+  Y <- data.frame(y1 = rep(1, n))
+  
+  # Construct initial Y Matrix values
+  Y$y2 <- (log(x / (1 - x)))
+  if (term > 2) {
+    Y$y3 <- (x - 0.5) * Y$y2
+  }
+  
+  if (term > 3) {
+    Y$y4 <- x - 0.5
+  }
+  
+  # Complete the values through the term limit
+  if (term > 4) {
+    for (i in 5:(term)) {
+      y <- paste0('y', i)
+      if (i %% 2 != 0) {
+        Y[[y]] <- Y$y4 ^ (i %/% 2)
+      }
+      if (i %% 2 == 0) {
+        z <- paste0('y', (i - 1))
+        Y[[y]] <- Y$y2 * Y[[z]]
+      }
+    }
+  }
+  
+  Y <- as.matrix(Y)
+
+  a <- as.matrix(coefficients)
+  s <- Y %*% a[1:term]
+  s <- (min_val + max_val * exp(s)) / (1 + exp(s))
+  return(as.numeric(s))
+}
+
+coefficients <- c(metalog_fit$A$a3)[metalog_fit$A$a3!=0] 
+n=1000
+min_val = metalog_fit$params$bounds[1]
+max_val = metalog_fit$params$bounds[2]
+sim_meta <- simulate_metalog_values(coefficients, n=1000, min=min_val, max=max_val)
+hist(sim_meta , breaks = 50, main = "Metalog Distribution", xlab = "Value", ylab = "Frequency")
+
+
+x <- stats::runif(n)
+  Y <- data.frame(y1 = rep(1, n))
+
+  # Construct initial Y Matrix values
+  Y$y2 <- (log(x / (1 - x)))
+
+  if (term > 2) {
+    Y$y3 <- (x - 0.5) * Y$y2
+  }
+
+  if (term > 3) {
+    Y$y4 <- x - 0.5
+  }
+
+  # Complete the values through the term limit
+  if (term > 4) {
+    for (i in 5:(term)) {
+      y <- paste0('y', i)
+      if (i %% 2 != 0) {
+        Y[`y`] <- Y$y4 ^ (i %/% 2)
+      }
+      if (i %% 2 == 0) {
+        z <- paste0('y', (i - 1))
+        Y[`y`] <- Y$y2 * Y[`z`]
+      }
+    }
+  }
+
+  Y <- as.matrix(Y)
+  amat <- paste0('a', term)
+  a <- as.matrix(m$A[`amat`])
+  s <- Y %*% a[1:term]
+
+  if (m$params$boundedness == 'sl') {
+    s <- m$params$bounds[1] + exp(s)
+  }
+
+  if (m$params$boundedness == 'su') {
+    s <- m$params$bounds[2] - exp(-(s))
+  }
+
+  if (m$params$boundedness == 'b') {
+    s <-
+      (m$params$bounds[1] + (m$params$bounds[2]) * exp(s)) /
+      (1 + exp(s))
+  }
+
+  return(as.numeric(s))
+
+n=1000
+term <- 9
+m=metalog_fit
+x <- stats::runif(n)
+Y <- data.frame(y1 = rep(1, n))
+
+# Construct initial Y Matrix values
+Y$y2 <- (log(x / (1 - x)))
+if (term > 2) {
+    Y$y3 <- (x - 0.5) * Y$y2
+  }
+
+  if (term > 3) {
+    Y$y4 <- x - 0.5
+  }
+
+  # Complete the values through the term limit
+  if (term > 4) {
+    for (i in 5:(term)) {
+      y <- paste0('y', i)
+      if (i %% 2 != 0) {
+        Y[`y`] <- Y$y4 ^ (i %/% 2)
+      }
+      if (i %% 2 == 0) {
+        z <- paste0('y', (i - 1))
+        Y[`y`] <- Y$y2 * Y[`z`]
+      }
+    }
+  }
+
+Y <- as.matrix(Y)
+
+amat <- paste0('a', term)
+a <- as.matrix(metalog_fit$A[`amat`])
+s <- Y %*% a[1:term]
+s <- (min_val + max_val * exp(s)) /
+      (1 + exp(s))
+s <- as.numeric(s)
+hist(s, breaks = 50, main = "Metalog Distribution", xlab = "Value", ylab = "Frequency")
+```
+
+
+```{r}
+#' Create random samples from an metalog distribution object
+#'
+#' @param m metalog object created from \code{metalog()}
+#' @param n number of observations (default is 1)
+#' @param term which metalog distribution to sample from
+#'
+#' @return A numeric vector of n random samples from a selected distribution
+#'
+#' @export
+#'
+#' @examples
+#' # Load example data
+#' \dontrun{
+#' data("fishSize")
+#'
+#' # Create a bounded metalog object
+#' myMetalog <- metalog(fishSize$FishSize,
+#'                      bounds=c(0, 60),
+#'                      boundedness = 'b',
+#'                      term_limit = 9,
+#'                      term_lower_bound = 9)
+#'
+#' s <- rmetalog(myMetalog, n=1000, term = 9)
+#' hist(s)
+#' }
+rmetalog <- function(m, n = 1, term = 3) {
+  UseMethod("rmetalog", m)
+}
+
+#' @export
+rmetalog.default <- function(m, n = 1, term = 3) {
+  print('Object must be of calss metalog')
+}
+
+#' @export
+n=1000
+m=metalog_fit
+term = 3
+rmetalog.metalog <- function(m, n = 1, term = 3){
+  # Input validation
+  valid_terms <- m$Validation$term
+  valid_terms_printout <- paste(valid_terms, collapse = " ")
+  if (class(n) != 'numeric' | n < 1 | n %% 1 != 0) {
+    stop('Error: n must be a positive numeric interger')
+  }
+  if (class(term) != 'numeric' |
+      term < 2 | term %% 1 != 0 | !(term %in% valid_terms) |
+      length(term) > 1) {
+    stop(
+      paste('Error: term must be a single positive numeric interger contained',
+            'in the metalog object. Available terms are:', valid_terms_printout)
+    )
+  }
+  x <- stats::runif(n)
+  Y <- data.frame(y1 = rep(1, n))
+
+  # Construct initial Y Matrix values
+  Y$y2 <- (log(x / (1 - x)))
+
+  if (term > 2) {
+    Y$y3 <- (x - 0.5) * Y$y2
+  }
+
+  if (term > 3) {
+    Y$y4 <- x - 0.5
+  }
+
+  # Complete the values through the term limit
+  if (term > 4) {
+    for (i in 5:(term)) {
+      y <- paste0('y', i)
+      if (i %% 2 != 0) {
+        Y[`y`] <- Y$y4 ^ (i %/% 2)
+      }
+      if (i %% 2 == 0) {
+        z <- paste0('y', (i - 1))
+        Y[`y`] <- Y$y2 * Y[`z`]
+      }
+    }
+  }
+
+  Y <- as.matrix(Y)
+  amat <- paste0('a', term)
+  a <- as.matrix(m$A[`amat`])
+  s <- Y %*% a[1:term]
+
+  if (m$params$boundedness == 'sl') {
+    s <- m$params$bounds[1] + exp(s)
+  }
+
+  if (m$params$boundedness == 'su') {
+    s <- m$params$bounds[2] - exp(-(s))
+  }
+
+  if (m$params$boundedness == 'b') {
+    s <-
+      (m$params$bounds[1] + (m$params$bounds[2]) * exp(s)) /
+      (1 + exp(s))
+  }
+
+  return(as.numeric(s))
+}
+
+
+#' Generate quantiles with a probability from a metalog object
+#'
+#' @param m metalog object created from \code{metalog()}
+#' @param y  vector of probabilities
+#' @param term which metalog distribution to sample from
+#'
+#' @return A numeric vector of quantiles corresponding to the y probability
+#'   vector
+#'
+#' @export
+#'
+#' @examples
+#' # Load example data
+#' \dontrun{
+#' data("fishSize")
+#'
+#' # Create a bounded metalog object
+#' myMetalog <- metalog(fishSize$FishSize,
+#'                      bounds=c(0, 60),
+#'                      boundedness = 'b',
+#'                      term_limit = 9,
+#'                      term_lower_bound = 9)
+#'
+#' s <- qmetalog(myMetalog,y=c(0.25,0.5,0.7),term = 9)
+#' }
+qmetalog <- function(m, y, term = 3) {
+  UseMethod("qmetalog", m)
+}
+
+#' @export
+qmetalog.default <- function(m, y, term = 3){
+  print('Object must be of class metalog')
+}
+
+#' @export
+qmetalog.metalog <- function(m, y, term = 3){
+  # Input validation
+  valid_terms <- m$Validation$term
+  valid_terms_printout <- paste(valid_terms, collapse = " ")
+  if (class(y) != 'numeric' | max(y) >= 1 | min(y) <= 0) {
+    stop('Error: y must be a positive numeric vector between 0 and 1')
+  }
+
+  if (class(term) != 'numeric' |
+      term < 2 | term %% 1 != 0 | !(term %in% valid_terms) |
+      length(term) > 1) {
+    stop(
+      paste('Error: term must be a single positive numeric interger contained',
+            'in the metalog object. Available terms are:', valid_terms_printout)
+    )
+  }
+
+  Y <- data.frame(y1 = rep(1, length(y)))
+
+  # Construct the Y Matrix initial values
+  Y$y2 <- (log(y / (1 - y)))
+
+  if (term > 2) {
+    Y$y3 <- (y - 0.5) * Y$y2
+  }
+
+  if (term > 3) {
+    Y$y4 <- (y - 0.5)
+  }
+
+  # Complete the values through the term limit
+  if (term > 4) {
+    for (i in 5:(term)) {
+      y <- paste0('y', i)
+      if (i %% 2 != 0) {
+        Y[`y`] <- Y$y4 ^ (i %/% 2)
+      }
+      if (i %% 2 == 0) {
+        z <- paste0('y', (i - 1))
+        Y[`y`] <- Y$y2 * Y[`z`]
+      }
+    }
+  }
+
+  Y <- as.matrix(Y)
+  amat <- paste0('a', term)
+  a <- as.matrix(m$A[`amat`])
+  s <- Y %*% a[1:term]
+
+  if (m$params$boundedness == 'sl') {
+    s <- m$params$bounds[1] + exp(s)
+  }
+
+  if (m$params$boundedness == 'su') {
+    s <- m$params$bounds[2] - exp(-(s))
+  }
+
+  if (m$params$boundedness == 'b') {
+    s <- (m$params$bounds[1] + (m$params$bounds[2]) * exp(s)) / (1 + exp(s))
+  }
+
+  return(as.numeric(s))
+}
+
+#' Generate probabilities with quantiles from a metalog object.
+#' This is done through a newtons method approximation.
+#'
+#' @param m metalog object created from \code{metalog()}
+#' @param q  vector of quantiles
+#' @param term which metalog distribution to sample from
+#'
+#' @return A numeric vector of probabilities corresponding to the q quantile
+#'   vector
+#'
+#' @export
+#'
+#' @examples
+#' # Load example data
+#' \dontrun{
+#' data("fishSize")
+#'
+#' # Create a bounded metalog object
+#' myMetalog <- metalog(fishSize$FishSize,
+#'                      bounds=c(0, 60),
+#'                      boundedness = 'b',
+#'                      term_limit = 9,
+#'                      term_lower_bound = 9)
+#'
+#' s <- pmetalog(myMetalog,q=c(3,10,25),term = 9)
+#' }
+pmetalog <- function(m, q, term = 3) {
+  UseMethod("pmetalog", m)
+}
+
+pmetalog.default <- function(m, q, term = 3){
+  print('Object must be of class metalog')
+}
+
+#' @export
+pmetalog.metalog <- function(m, q, term = 3){
+  # Input validation
+  valid_terms <- m$Validation$term
+  if (class(q) != 'numeric') {
+    stop('Error: q must be a positive numeric vector between 0 and 1')
+  }
+
+  if (class(term) != 'numeric' |
+      term < 2 | term %% 1 != 0 | !(term %in% valid_terms) |
+      length(term) > 1) {
+    stop(
+      cat('Error: term must be a single positive numeric interger contained',
+            'in the metalog object. Available terms are:',
+            valid_terms)
+    )
+  }
+
+ qs<-sapply(q,newtons_method_metalog,m=m,t=term)
+ return(qs)
+}
+
+#' Generate density values with quantiles from a metalog object.
+#' This is done through a newtons method approximation.
+#'
+#' @param m metalog object created from \code{metalog()}
+#' @param q  y vector of quantiles
+#' @param term which metalog distribution to sample from
+#'
+#' @return A numeric vector of probabilities corresponding to the q quantile
+#'   vector
+#'
+#' @export
+#'
+#' @examples
+#' # Load example data
+#' \dontrun{
+#' data("fishSize")
+#'
+#' # Create a bounded metalog object
+#' myMetalog <- metalog(fishSize$FishSize,
+#'                      bounds=c(0, 60),
+#'                      boundedness = 'b',
+#'                      term_limit = 9,
+#'                      term_lower_bound = 9)
+#'
+#' s <- dmetalog(myMetalog,q=c(3,10,25),term = 9)
+#' }
+dmetalog <- function(m, q, term = 3) {
+  UseMethod("dmetalog", m)
+}
+
+dmetalog.default <- function(m, q, term = 3){
+  print('Object must be of class metalog')
+}
+
+#' @export
+dmetalog.metalog <- function(m, q, term = 3){
+  # Input validation
+  valid_terms <- m$Validation$term
+  if (class(q) != 'numeric') {
+    stop('Error: q must be a numeric vector')
+  }
+
+  if (class(term) != 'numeric' |
+      term < 2 | term %% 1 != 0 | !(term %in% valid_terms) |
+      length(term) > 1) {
+    stop(
+      paste('Error: term must be a single positive numeric interger contained',
+            'in the metalog object. Available terms are:',
+            valid_terms)
+    )
+  }
+
+  qs<-sapply(q,newtons_method_metalog,m=m,term=term)
+  ds<-sapply(qs,pdfMetalog_density, m=m,t=term)
+  return(ds)
+}
+
+#' Summary of the metalog object
+#'
+#' @param object metalog object created from \code{metalog()}
+#' @param ... ignored; included for S3 generic/method consistency
+#'
+#' @return A summary of the object
+#'
+#' @export
+#'
+#' @examples
+#' # Load example data
+#' \dontrun{
+#' data("fishSize")
+#'
+#' # Create a bounded metalog object
+#' myMetalog <- metalog(fishSize$FishSize,
+#'                      bounds=c(0, 60),
+#'                      boundedness = 'b',
+#'                      term_limit = 13)
+#'
+#' summary(myMetalog)
+#' }
+summary.metalog <- function(object, ...) {
+  cat(' -----------------------------------------------\n',
+      'Summary of Metalog Distribution Object\n',
+      '-----------------------------------------------\n',
+      '\nParameters\n',
+      'Term Limit: ', object$params$term_limit, '\n',
+      'Term Lower Bound: ', object$params$term_lower_bound, '\n',
+      'Boundedness: ', object$params$boundedness, '\n',
+      'Bounds (only used based on boundedness): ', object$params$bounds, '\n',
+      'Step Length for Distribution Summary: ', object$params$step_len, '\n',
+      'Method Use for Fitting: ', object$params$fit_method, '\n',
+      'Number of Data Points Used: ', object$params$number_of_data, '\n',
+      'Original Data Saved: ', object$params$save_data, '\n',
+      '\n\n Validation and Fit Method\n'
+  )
+  print(object$Validation, row.names = FALSE)
+}
+
+
+#' Plot of the metalog object
+#'
+#' @param x metalog object created using \code{metalog()}
+#' @param ... ignored; included for S3 generic/method consistency
+#'
+#' @return A summary plot of the CDF and PDF for each term
+#'
+#' @export
+#'
+#' @examples
+#' # Load example data
+#' \dontrun{
+#' data("fishSize")
+#'
+#' # Create a bounded metalog object
+#'
+#' myMetalog <- metalog(fishSize$FishSize,
+#'                      bounds=c(0, 60),
+#'                      boundedness = 'b',
+#'                      term_limit = 13)
+#'
+#' plot(myMetalog)
+#' }
+plot.metalog <- function(x, ...) {
+  #build plots
+  InitalResults <-
+    data.frame(
+      term = (rep(
+        paste0(x$params$term_lower_bound, ' Terms'), length(x$M[, 1])
+      )),
+      pdfValues = x$M[, 1],
+      quantileValues = x$M[, 2],
+      cumValue = x$M$y
+    )
+
+  if (ncol(x$M) > 3) {
+    for (i in 2:(length(x$M[1,] - 1) / 2)) {
+      TempResults <-
+        data.frame(
+          term = (rep(paste((x$params$term_lower_bound + (i - 1)), 'Terms'),
+                      length(x$M[, 1]))),
+          pdfValues = x$M[, (i * 2 - 1)],
+          quantileValues = x$M[, (i * 2)],
+          cumValue = x$M$y
+        )
+
+      InitalResults <- rbind(InitalResults, TempResults)
+    }
+  }
+
+  # PDF plot
+  p <-
+    ggplot2::ggplot(InitalResults, aes(x = quantileValues, y = pdfValues)) +
+    ggplot2::geom_line(colour = "blue") +
+    ggplot2::xlab("Quantile Values") +
+    ggplot2::ylab("PDF Values") +
+    ggplot2::facet_wrap(~ term, ncol = 4, scales = "free_y")
+
+  # The base plot
+  q <-
+    ggplot2::ggplot(InitalResults, aes(x = quantileValues, y = cumValue)) +
+    ggplot2::geom_line(colour = "blue") +
+    ggplot2::xlab("Quantile Values") +
+    ggplot2::ylab("CDF Values") +
+    ggplot2::facet_wrap(~ term, ncol = 4, scales = "free_y")
+
+  list(pdf = p, cdf = q)
+}
+```
+
+
+
+```{r}
+# Assume you have two datasets: data1 and data2
+# Fit metalog distributions to the data
+metalog_fit1 <- metalog(data1, probs = seq(0, 1, 0.1), boundedness = "u", term_limit = 9)
+metalog_fit2 <- metalog(data2, probs = seq(0, 1, 0.1), boundedness = "u", term_limit = 9)
+
+# Transform the data using metalog CDF and qnorm
+transformed_data1 <- qnorm(pmetalog(metalog_fit1, data1, term = 9))
+transformed_data2 <- qnorm(pmetalog(metalog_fit2, data2, term = 9))
+
+# Fit a multivariate normal distribution
+library(MASS)
+mvnorm_fit <- mvrnorm(n = length(data1), mu = c(mean(transformed_data1), mean(transformed_data2)), 
+                     Sigma = cov(cbind(transformed_data1, transformed_data2)))
+
+# Simulation
+simulated_normal <- mvrnorm(n = 1000, mu = c(mean(transformed_data1), mean(transformed_data2)), 
+                            Sigma = cov(cbind(transformed_data1, transformed_data2)))
+
+# Transform the simulated values back to original scale
+simulated_data1 <- qmetalog(metalog_fit1, pnorm(simulated_normal[, 1]), term = 9)
+simulated_data2 <- qmetalog(metalog_fit2, pnorm(simulated_normal[, 2]), term = 9)
+
+
+
+
+
+# Load necessary libraries
+library(mvtnorm) # for rmvnorm and dmnorm
+library(rmetalog) # for metalog functions
+
+# 1. Generate synthetic bivariate data
+set.seed(123)
+original_data <- rmvnorm(1000, mean = c(50, 60), sigma = matrix(c(100, 30, 30, 90), 2, 2))
+data1 <- original_data[, 1]
+data2 <- original_data[, 2]
+
+# 2. Fit metalog distributions to the marginals
+metalog_fit1 <- metalog(data1, probs = seq(0, 1, 0.1), boundedness = "u", term_limit = 9)
+metalog_fit2 <- metalog(data2, probs = seq(0, 1, 0.1), boundedness = "u", term_limit = 9)
+
+# 3. Transform the data using metalog CDF and qnorm
+transformed_data1 <- qnorm(pmetalog(metalog_fit1, data1, term = 9))
+transformed_data2 <- qnorm(pmetalog(metalog_fit2, data2, term = 9))
+
+# 4. Simulate from the multivariate normal distribution with the transformed data
+simulated_normal <- rmvnorm(1000, mean = c(mean(transformed_data1), mean(transformed_data2)), 
+                            sigma = cov(cbind(transformed_data1, transformed_data2)))
+
+# 5. Transform the simulated values back to the original scale
+simulated_data1 <- qmetalog(metalog_fit1, pnorm(simulated_normal[, 1]), term = 9)
+simulated_data2 <- qmetalog(metalog_fit2, pnorm(simulated_normal[, 2]), term = 9)
+
+# Viewing the first few rows of the simulated data
+head(cbind(simulated_data1, simulated_data2))
+
+```
+

@@ -1,0 +1,388 @@
+---
+title: "Simulating correlated soil property values from empirical distributions modeled with metalog distributions using R"
+output:
+  word_document: default
+  html_notebook: default
+---
+
+This script outlines the steps to simulate correlated soil property values using the Cholesky Decomposition Method, where the empirical distributions are modeled using metalog distributions. The metalog distribution is a flexible distribution system that can model empirical data without specifying a predefined distribution form.
+
+
+### Step 1: Simulate Example Soil Property Data
+
+First, we'll generate synthetic data for three soil properties to use as our empirical dataset. These properties might represent, for example, pH levels, organic matter content, and bulk density, each with distinct distributions.
+
+```{r}
+set.seed(123)  # For reproducibility
+
+# Generating synthetic soil property data
+soil_data <- data.frame(
+  pH = rbeta(2000, shape1 = 5, shape2 = 3) * 4 + 4,  # pH ranging roughly from 4 to 8
+  OrganicMatter = rlnorm(2000, meanlog = 0, sdlog = 0.25),  # Log-normal distribution
+  BulkDensity = runif(2000, min = 1.2, max = 1.6)  # Uniform distribution
+)
+```
+
+### Step 2: Install and Load the `metalog` and `MASS` Packages
+
+```{r}
+if (!requireNamespace("rmetalog", quietly = TRUE)) install.packages("metalog")
+if (!requireNamespace("MASS", quietly = TRUE)) install.packages("MASS")
+library(rmetalog)
+library(MASS)
+```
+
+### Step 3: Fit Metalog Distributions to the Soil Data
+
+```{r}
+metalog_fits <- list()
+for(i in 1:ncol(soil_data)) {
+  metalog_fits[[i]] <- metalog(x = soil_data[[i]], term_limit = 5, bounds = c(min(soil_data[[i]]), max(soil_data[[i]])), step_len = 0.01, boundedness = 'b')
+}
+```
+
+View the original empirical distribution
+```{r}
+# Sample from the fitted metalog distribution
+sampled_data1 <- rmetalog(metalog_fits[[1]], n = 2000, term=4)
+sampled_data2 <- qmetalog(metalog_fits[[1]], y = runif(2000), term=4)
+
+# Combine original and sampled data for plotting
+data_to_plot1 <- data.frame(value = c(soil_data$pH, sampled_data1),
+                           type = factor(c(rep("Original", length(soil_data$pH)), rep("Sampled", length(sampled_data1)))))
+
+data_to_plot2 <- data.frame(value = c(soil_data$pH, sampled_data2),
+                           type = factor(c(rep("Original", length(soil_data$pH)), rep("Sampled", length(sampled_data2)))))
+
+# Plot
+ggplot(data_to_plot1, aes(x = value, fill = type)) +
+  geom_histogram(position = "identity", alpha = 0.5, bins = 30) +
+  labs(title = "Comparison of Original and Sampled Distributions 1",
+       x = "Value",
+       y = "Frequency") +
+  scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+  theme_minimal()
+
+ggplot(data_to_plot2, aes(x = value, fill = type)) +
+  geom_histogram(position = "identity", alpha = 0.5, bins = 30) +
+  labs(title = "Comparison of Original and Sampled Distributions 2",
+       x = "Value",
+       y = "Frequency") +
+  scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+  theme_minimal()
+
+# Plot with 100 bins for Distribution 1
+ggplot(data_to_plot1, aes(x = value, fill = type)) +
+    geom_histogram(position = "identity", alpha = 0.5, bins = 100) +  # Increased number of bins
+    labs(title = "Comparison of Original and Sampled Distributions 1",
+         x = "Value",
+         y = "Frequency") +
+    scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    theme_minimal()
+
+# Plot with 100 bins for Distribution 2
+ggplot(data_to_plot2, aes(x = value, fill = type)) +
+    geom_histogram(position = "identity", alpha = 0.5, bins = 100) +  # Increased number of bins
+    labs(title = "Comparison of Original and Sampled Distributions 2",
+         x = "Value",
+         y = "Frequency") +
+    scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    theme_minimal()
+
+# Density Plot for Distribution 1
+ggplot(data_to_plot1, aes(x = value, fill = type, color = type, alpha = type)) +
+    geom_density(adjust = 1.5, bw = 0.1) +  # You can adjust the bandwidth to fine-tune the smoothness
+    labs(title = "Comparison of Original and Sampled Distributions 1",
+         x = "Value",
+         y = "Density") +
+    scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    scale_color_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    scale_alpha_manual(values = c("Original" = 1, "Sampled" = 0.5)) +
+    theme_minimal() +
+    guides(alpha = FALSE, color = FALSE)  # Hide the alpha and color legends
+
+# Density Plot for Distribution 2
+ggplot(data_to_plot2, aes(x = value, fill = type, color = type, alpha = type)) +
+    geom_density(adjust = 1.5, bw = 0.1) +  # Adjust and bandwidth are the same for consistency
+    labs(title = "Comparison of Original and Sampled Distributions 2",
+         x = "Value",
+         y = "Density") +
+    scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    scale_color_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    scale_alpha_manual(values = c("Original" = 1, "Sampled" = 0.5)) +
+    theme_minimal() +
+    guides(alpha = FALSE, color = FALSE)  # Hide the alpha and color legends
+```
+
+### Step 4: Calculate the Correlation Matrix and Perform Cholesky Decomposition
+
+```{r}
+correlation_matrix <- cor(soil_data)
+cholesky_decomp <- chol(correlation_matrix)
+```
+
+### Step 5: Simulate Uncorrelated Values from Metalog Distributions
+
+```{r}
+n_sim <- 1000  # Number of simulations
+uncorrelated_simulations <- matrix(nrow = n_sim, ncol = ncol(soil_data))
+
+for(i in 1:ncol(soil_data)) {
+  uncorrelated_simulations[, i] <- qmetalog(metalog_fits[[i]], y = runif(n_sim), term=3)
+}
+```
+
+### Step 6: Apply Cholesky Decomposition to Obtain Correlated Simulations
+
+```{r}
+correlated_simulations <- t(cholesky_decomp %*% t(uncorrelated_simulations))
+```
+
+### Step 7: Check Correlations in Simulated Data (Optional Validation)
+
+This step involves checking if the simulated data maintain the correlation structure similar to the original `soil_data`.
+
+```{r}
+simulated_data <- as.data.frame(correlated_simulations)
+colnames(simulated_data) <- colnames(soil_data)
+
+simulated_correlation_matrix <- cor(simulated_data)
+print(simulated_correlation_matrix)
+```
+
+This example workflow generates synthetic soil property data, models these properties using metalog distributions, and simulates new, correlated data based on these empirical distributions. The final correlation matrix printed should be similar to the one derived from the original `soil_data`, validating the process.
+
+
+To create simulated soil profile instances that comprise several soil properties (e.g., Organic Matter (OM), clay percentage, bulk density, pH) at several depth intervals (e.g., 0-10 cm, 10-30 cm, 30-50 cm), while retaining the correlation structure not only between different soil properties but also across different depths, you can use a more comprehensive approach. This involves modeling the entire soil profile as a multivariate problem where correlations both between different properties and across depths are considered. Here’s a strategy to achieve this:
+
+### Step 1: Structure Your Data for Multivariate Analysis Across Depths
+
+1. **Combine Your Data**: For each soil property, you need to treat the measurements at different depths as distinct variables that are part of a larger, multivariate dataset. This means, for instance, that OM at 0-10 cm, OM at 10-30 cm, and OM at 30-50 cm are three separate variables.
+
+2. **Correlation Matrix**: Construct a correlation matrix that includes the correlations between all combinations of soil properties and depths. This comprehensive correlation matrix will guide the simulation process, ensuring that correlations are maintained both between different properties and across depths.
+
+### Step 2: Fit Metalog Distributions
+
+For each "variable" (i.e., each soil property at each depth), fit a metalog distribution. This might result in a large number of fitted distributions, but it's necessary to capture the empirical distribution of each measurement accurately.
+
+### Step 3: Correlation Matrix and Cholesky Decomposition
+
+1. **Full Correlation Matrix**: Use your comprehensive correlation matrix from Step 1, which should be large, covering all soil properties at all depths.
+
+2. **Cholesky Decomposition**: Perform Cholesky decomposition on this full correlation matrix to obtain the transformation matrix.
+
+### Step 4: Simulate Correlated Multivariate Data
+
+1. **Simulate Uncorrelated Data**: For each variable, simulate uncorrelated data based on the metalog distributions fitted in Step 2.
+
+2. **Apply Cholesky Decomposition**: Transform the uncorrelated simulated data into correlated data using the matrix from the Cholesky decomposition. This step ensures that the simulated data respects the complex correlation structure you've identified, both between soil properties and across depths.
+
+### Step 5: Construct Simulated Soil Profile Instances
+
+After obtaining the simulated, correlated data, restructure this data to reflect individual soil profile instances. Each instance should now realistically represent the variability and correlation structure of soil properties across different depths.
+
+### Example Conceptual Workflow in R
+
+Given the complexity of this task, a full R code example would be extensive and highly dependent on your specific dataset. However, the conceptual workflow would involve:
+
+- Organizing your dataset so each column represents a specific combination of soil property and depth interval.
+- Computing a comprehensive correlation matrix for these columns.
+- Fitting metalog distributions for each column.
+- Simulating uncorrelated data from these distributions.
+- Applying Cholesky decomposition to introduce the appropriate correlations.
+- Reshaping the correlated, simulated data back into a format that represents individual soil profiles.
+
+### Important Considerations
+
+- **Data Volume**: This approach requires a substantial volume of data to accurately compute the correlations between all pairs of variables.
+- **Complexity**: The complexity of your correlation matrix and the number of distributions you need to manage increases significantly as you add more soil properties and depth intervals.
+- **Computation**: The computational demand, especially for the simulation step, will be high. Efficient coding and possibly parallel processing might be necessary for large datasets.
+
+This strategy ensures that your simulated soil profiles are realistic, reflecting both the variability of soil properties within specific depth intervals and the correlation between these properties across different depths.
+
+
+Code to simulate data from the metalog distribution for the larger area, then determine the best-fitting statistical distribution for that simulated data, and finally use the identified distribution along with specified range and central tendency to generate synthetic data. This approach allows you to model data for a smaller area with less variability or different characteristics than the larger area from which the original metalog distribution was derived.
+
+
+### Step 1: Simulate Data from the Metalog Distribution
+
+
+```{r}
+library(rmetalog)
+
+# Number of data points you want to simulate
+n_sim <- 1000
+
+# Simulate data from the fitted metalog distribution
+simulated_data <- rmetalog(metalog_fits[[1]], n = n_sim)
+```
+
+### Step 2: Find the Best-Fitting Statistical Distribution
+
+You can use various criteria and tests (e.g., Akaike Information Criterion (AIC), Bayesian Information Criterion (BIC), goodness-of-fit tests) to compare how well different distributions fit the simulated data. The `fitdistrplus` package can help with fitting distributions and comparing fits:
+
+```{r}
+library(fitdistrplus)
+source('https://raw.githubusercontent.com/mhahsler/fit_dist/master/fit_dist.R')
+
+fit_dist <- function(x, distributions = NULL, discrete = NULL, 
+  plot = TRUE, ...) {
+   
+  dists_cont = c("unif", "norm", "lnorm", "exp", "gamma", "beta", "weibull")
+  dists_disc = c("binom", "pois", "nbinom", "geom", "hyper")
+  
+  x <- x[is.finite(x)]
+ 
+  if(is.null(distributions)) {
+    if(is.null(discrete)) discrete <- ifelse(all(x == floor(x)), TRUE, FALSE)
+    
+    if(discrete) distributions <- dists_disc
+    else distributions <- dists_cont
+  }
+ 
+  cat("Fitting", paste(distributions, collapse = ", "), "\n") 
+  
+  # fit distributions 
+  f <- lapply(distributions, function(d) {
+    try(fitdist(x, d, ...), silent = FALSE)
+    })
+
+  names(f) <- distributions
+  f <- f[!sapply(f, is, "try-error")]
+  
+  # create plots
+  if(plot) {
+    oldpar <- par(mfrow = c(1, 2))
+    denscomp(f, legendtext = names(f))
+    qqcomp(f, legendtext = names(f))
+    #cdfcomp(f, legendtext = names(f))
+    #ppcomp(f, legendtext = names(f))
+    par(oldpar)
+  }
+  
+  # calculate goodness-of-fit statistics
+  # Note: if is for a bug in gofstat
+  gof <- gofstat(if(length(f)<2) f[[1]] else f, fitnames = names(f))
+  attr(f, "gof") <- gof
+  
+  if(is.null(gof$kstest)) gof$kstest <- rep(NA, times = length(gof$aic))
+  if(is.null(gof$cvmtest)) gof$cvmtest <- rep(NA, times = length(gof$aic))
+  if(is.null(gof$adtest)) gof$adtest <- rep(NA, times = length(gof$aic))
+  if(is.null(gof$chisqpvalue)) gof$chisqpvalue <- rep(NA, times = length(gof$aic))
+
+  cat("Test results:\n")
+  print(data.frame(
+    "Kolmogorov-iSmirnov test" = gof$kstest,
+    "Cramer-von Mises test" = gof$cvmtest,
+    "Anderson-Darling test" = gof$adtest,
+    "Chi-Square p-value" = gof$chisqpvalue))
+  
+   cat(paste("\n*** Best fit using the AIC is:", 
+    names(which.min(gof$aic)),"***\n")) 
+   cat(paste("*** Best fit using the BIC is:", 
+    names(which.min(gof$bic)),"***\n\n")) 
+  
+  f
+}
+
+fit <- fit_dist(simulated_data$pH)
+# Fit different distributions to the simulated data
+fit_norm <- fitdist(simulated_data, "norm")
+fit_unif <- fitdist(simulated_data, "unif")
+fit_logn <- fitdist(simulated_data, "lnorm")
+
+# Compare the fits using AIC, for example
+aic_values <- c(fit_norm$aic, fit_unif$aic, fit_logn$aic)
+names(aic_values) <- c("Normal", "Uniform", "Log-normal")
+
+# Identify the best fit based on the lowest AIC
+best_fit_name <- names(which.min(aic_values))
+print(paste("Best fit based on AIC:", best_fit_name))
+```
+
+### Step 3: Generate Synthetic Data Based on Best Fit, Range, and Central Tendency
+
+After identifying the best fit, you can generate synthetic data using this distribution. Suppose you want to adjust the range and central tendency for the smaller area:
+
+```{r}
+new_mean <- 6.5  # New central tendency
+new_min <- 5.5   # New minimum value
+new_max <- 7.5   # New maximum value
+
+# Assuming the best fit was a normal distribution (for illustration)
+# Adjust the mean and standard deviation based on the new range and central tendency
+sd_adjusted <- (new_max - new_min) / 4  # Example adjustment
+
+# Generate synthetic data with the new parameters
+synthetic_data <- rnorm(n_sim, mean = new_mean, sd = sd_adjusted)
+
+# Truncate to ensure the data falls within the new range (optional)
+synthetic_data <- pmin(pmax(synthetic_data, new_min), new_max)
+```
+
+### Step 4: Validate and Adjust
+
+It's essential to validate that the synthetic data generated in Step 3 adequately represents the smaller area. You might need to adjust your approach based on additional knowledge about the soil properties and how they distribute in the specific context of the smaller area. Validation could involve statistical comparisons, expert review, or both.
+
+This workflow allows you to leverage the flexibility of metalog distributions for simulating data, while also enabling you to refine and adjust this data to more accurately model specific conditions or characteristics of a smaller or different area.
+
+Adjusting a Weibull distribution to fit a new range and central tendency is not straightforward in the same way you might scale or shift a normal distribution, due to the Weibull distribution's specific shape and scale parameters and how they influence its range and central tendency. The Weibull distribution is defined by its shape parameter (\(k\)) and scale parameter (\(\lambda\)), and neither directly corresponds to the mean or variance in a simple linear way.
+
+However, you can approach the problem by finding new parameters (\(k\) and \(\lambda\)) that result in the desired range and central tendency. This typically requires a numerical approach, as there's no simple formula to directly adjust \(k\) and \(\lambda\) based on a new mean or range. Here’s a conceptual approach:
+
+### Understanding the Weibull Parameters
+
+- The **shape parameter** (\(k\)) affects the distribution's skewness.
+- The **scale parameter** (\(\lambda\)) affects the distribution's spread.
+
+The mean (\(\mu\)) of a Weibull distribution is given by \(\mu = \lambda \Gamma(1 + \frac{1}{k})\), where \(\Gamma\) is the gamma function. This relationship can be used in adjusting the parameters to achieve a certain mean, but adjusting for a specific range simultaneously adds complexity.
+
+### Strategy for Adjustment
+
+1. **Determine Desired Properties**: Identify the new desired mean (central tendency) and range (or min and max) for your data.
+   
+2. **Numerical Optimization**: Use numerical methods to find \(k\) and \(\lambda\) values that result in a Weibull distribution closely matching your desired properties. This might involve optimizing to minimize the difference between the desired and actual mean and range derived from the Weibull parameters.
+
+### Example in R
+
+This example demonstrates a simplified approach to adjust \(k\) and \(\lambda\) for a new desired mean, without focusing on range adjustment. For range, especially min and max, fitting might need a more tailored approach due to the Weibull's tail behavior.
+
+```{r}
+# Desired new mean (central tendency)
+new_mean <- 10
+
+# Function to calculate Weibull mean given k and lambda
+weibull_mean <- function(k, lambda) {
+  lambda * gamma(1 + 1/k)
+}
+
+# Optimization function to find k and lambda for the new mean
+optimize_weibull_params <- function(target_mean) {
+  cost_function <- function(params) {
+    k <- params[1]
+    lambda <- params[2]
+    current_mean <- weibull_mean(k, lambda)
+    (current_mean - target_mean)^2  # Cost is the square difference from the target
+  }
+  
+  # Initial guesses for k and lambda
+  init_guess <- c(1, target_mean)
+  
+  # Optimize
+  opt_res <- optim(init_guess, cost_function)
+  
+  return(opt_res$par)  # Return optimized k and lambda
+}
+
+# Find k and lambda for the new mean
+new_params <- optimize_weibull_params(new_mean)
+new_k <- new_params[1]
+new_lambda <- new_params[2]
+
+# Report new k and lambda
+print(paste("New k:", new_k, "New lambda:", new_lambda))
+```
+
+This approach uses R's `optim()` function for numerical optimization, minimizing the difference between the Weibull mean calculated from \(k\) and \(\lambda\) and the desired new mean. Adjusting for specific min/max range would require a more complex model that considers the Weibull's full distribution characteristics, potentially involving constraints in the optimization to ensure the distribution fits within the desired range. 
+
+Remember, this example focuses on adjusting for a new mean. Incorporating range constraints directly involves considering the distribution's tails and may not be straightforward without a clear definition of how the range relates to \(k\) and \(\lambda\).

@@ -1,0 +1,327 @@
+---
+title: "KSSL Soil Property Correlations"
+output: html_notebook
+---
+
+
+# generate correlation matrix
+```{r}
+
+# connect
+db_path <- 'C:/R_Drive/Data_Files/LPKS_Data/Data/Soil_Pedon_Databases/NRCS/KSSL/LabDataMart_4-17-23/ncss_labdata.sqlite'
+output_path <- here::here('data/phys_props.Rds')
+
+# Connect to the SQLite database
+db <- RSQLite::dbConnect(RSQLite::SQLite(), db_path)
+
+# List tables (for diagnostic purposes)
+RSQLite::dbListTables(db)
+
+# Retrieve lab physical properties data from the database
+lab_phy <- RSQLite::dbGetQuery(db, "SELECT * FROM lab_physical_properties;")
+lab_chem <- RSQLite::dbGetQuery(db, "SELECT * FROM lab_chemical_properties;")
+lab_layer <- RSQLite::dbGetQuery(db, "SELECT * FROM lab_layer;")
+
+
+# Calculate rock fragment volume:
+# 1. Assign default particle density values if missing
+lab_phy <- lab_phy |>
+  dplyr::mutate(
+    particle_density_less_than_2mm = ifelse(is.na(particle_density_less_than_2mm), 2.65, particle_density_less_than_2mm),
+    particle_density_gt_2_mm = ifelse(is.na(particle_density_gt_2_mm), 2.65, particle_density_gt_2_mm)
+  )
+
+# 2. Determine the bulk density to use based on availability
+lab_phy <- lab_phy |>
+  dplyr::mutate(
+    bulk_density_used = ifelse(!is.na(bulk_density_oven_dry), bulk_density_oven_dry, bulk_density_third_bar)
+  )
+
+# 3. Compute rock fragment volume and related parameters using rowwise operations
+lab_phy <- lab_phy |>
+  dplyr::rowwise() |>
+  dplyr::mutate(
+    total_rf_wt_pct = total_frag_wt_pct_gt_2_mm_ws,  # Total rock fragment weight percent
+    M_RF = total_rf_wt_pct,                           # Mass of rock fragments (assume 100 g total soil mass)
+    M_FE = 100 - M_RF,                                # Mass of fine earth fraction
+    V_RF = M_RF / particle_density_gt_2_mm,           # Volume of rock fragments (cm³)
+    V_FE = M_FE / bulk_density_used,                  # Volume of fine earth fraction (cm³)
+    V_Total = V_RF + V_FE,                            # Total soil volume (cm³)
+    Vol_RF_Pct = (V_RF / V_Total) * 100               # Volumetric rock fragment content (%)
+  ) |>
+  dplyr::ungroup()
+
+# Extract physical properties of interest
+phys_props <- lab_phy |>
+  dplyr::select(
+    labsampnum, clay = clay_total, silt = silt_total, sand = sand_total,
+    db = bulk_density_used, wr_3b = water_retention_third_bar, wr_15b = water_retention_15_bar,
+    rfv = Vol_RF_Pct
+  )
+phys_props <- stats::na.omit(phys_props)
+
+# Process soil texture data for compositional transformation
+txt <- phys_props |>
+  dplyr::select(sand, silt, clay) |>
+  as.matrix()
+txt_acomp <- compositions::acomp(txt)
+txt_ilr <- compositions::ilr(txt_acomp)
+txt_ilr <- as.data.frame(txt_ilr) |> purrr::set_names("ilr1", "ilr2")
+
+# Extract chemical properties of interest
+chem_props <- lab_chem |>
+  dplyr::select(
+    labsampnum, ph=ph_h2o, cec=cec_nh4_ph_7, soc=estimated_organic_carbon
+  )
+chem_props <- stats::na.omit(chem_props)
+
+
+
+# Combine the physical properties with the ilr-transformed texture data
+phys_props_ilr <- cbind(phys_props, txt_ilr) |>
+  dplyr::select(labsampnum, db, wr_3b, wr_15b, ilr1, ilr2, rfv)
+cor_props <- phys_props_ilr |> dplyr::inner_join(chem_props, by="labsampnum")
+cor_props <- cor_props |> dplyr::left_join(lab_layer |> dplyr::select(labsampnum, hzn_desgn), by="labsampnum")
+cor_props$genhz <- aqp::generalizeHz(
+  cor_props$hzn_desgn,
+  new = c('O', 'A', 'E', 'B', 'C', 'Cr', 'R'),
+  pattern = c('O', '^\\d*A', '^\\d*E', '^\\d*B', '^\\d*C', '^\\d*Cr', '^\\d*R'),
+  ordered = TRUE
+)
+cor_props <- cor_props |> dplyr::select(-labsampnum, -hzn_desgn)
+
+
+phys_props_hz <- phys_props |> dplyr::left_join(lab_layer |> dplyr::select(labsampnum, hzn_desgn), by="labsampnum")
+phys_props_hz$genhz <- aqp::generalizeHz(
+  phys_props_hz$hzn_desgn,
+  new = c('O', 'A', 'E', 'B', 'C', 'Cr', 'R'),
+  pattern = c('O', '^\\d*A', '^\\d*E', '^\\d*B', '^\\d*C', '^\\d*Cr', '^\\d*R'),
+  ordered = TRUE
+)
+txt_props <- phys_props_hz |>
+  dplyr::select(genhz, sand, silt, clay)
+
+
+# Define the general horizon (genhz) categories to subset
+genhz_categories <- c('O', 'A', 'E', 'B', 'C', 'Cr', 'R')
+
+# Property correlation by generalized horizon
+# Initialize an empty list to store correlation matrices
+cor_matrices <- list()
+
+# Loop through each genhz category and compute the correlation matrix
+for (hz in genhz_categories) {
+  # Subset the dataframe based on genhz value
+  subset_data <- cor_props |> dplyr::filter(genhz == hz)
+  
+  # Ensure the subset has more than one row to compute correlation
+  if (nrow(subset_data) > 1) {
+    cor_matrices[[hz]] <- stats::cor(subset_data |> dplyr::select(-genhz), method = "pearson", use = "complete.obs")
+  } else {
+    cor_matrices[[hz]] <- NA  # Assign NA if insufficient data
+    message(paste("Skipping correlation for", hz, "- not enough data."))
+  }
+}
+
+# Texture correlation by generalized horizon
+# Initialize an empty list to store correlation matrices
+cor_matrices_txt <- list()
+
+# Loop through each genhz category and compute the correlation matrix
+for (hz in genhz_categories) {
+  # Subset the dataframe based on genhz value
+  subset_data <- txt_props |> dplyr::filter(genhz == hz)
+  
+  # Ensure the subset has more than one row to compute correlation
+  if (nrow(subset_data) > 1) {
+    cor_matrices_txt[[hz]] <- stats::cor(subset_data |> dplyr::select(-genhz), method = "pearson", use = "complete.obs")
+  } else {
+    cor_matrices_txt[[hz]] <- NA  # Assign NA if insufficient data
+    message(paste("Skipping correlation for", hz, "- not enough data."))
+  }
+}
+
+
+
+# # Calculate correlation matrices using Pearson's method with complete observations
+# global_cor_matrix <- stats::cor(cor_props, method = "pearson", use = "complete.obs")
+# txt_cor <- stats::cor(txt_props, method = "pearson", use = "complete.obs")
+
+# Save the physical properties data as an RDS file
+saveRDS(cor_matrices, here::here("raw-data/global_cor_matrices.rds"))
+saveRDS(cor_matrices_txt, here::here("raw-data/global_cor_texture_matrices.rds"))
+# Disconnect from the database
+DBI::dbDisconnect(db)
+
+```
+
+
+
+```{r}
+# Create a list of correlation matrices for each horizon group
+global_cor_matrices <- list(
+# Correlation matrix for horizon "O"
+  O = matrix(
+    c(
+      1.00000000, -0.63250340, -0.35932548,  0.09013662,  0.27505263,  0.21053013,  0.20979638, -0.19634915, -0.51732223,
+      -0.63250340,  1.00000000,  0.43018007,  0.00585718, -0.03951910, -0.14150551, -0.15175188,  0.19644287,  0.41419265,
+      -0.35932548,  0.43018007,  1.00000000, -0.11158370, -0.06582821, -0.13935279, -0.22966180,  0.50735607,  0.57045333,
+      0.09013662,  0.00585718, -0.11158370,  1.00000000,  0.78513040, -0.13674935,  0.29335808,  0.00562655, -0.31505547,
+      0.27505263, -0.03951910, -0.06582821,  0.78513040,  1.00000000, -0.06847662,  0.23513283,  0.10227036, -0.26792500,
+      0.21053013, -0.14150551, -0.13935279, -0.13674935, -0.06847662,  1.00000000,  0.01046444, -0.06997910, -0.08499784,
+      0.20979638, -0.15175188, -0.22966180,  0.29335808,  0.23513283,  0.01046444,  1.00000000, -0.33801788, -0.56850143,
+      -0.19634915,  0.19644287,  0.50735607,  0.00562655,  0.10227036, -0.06997910, -0.33801788,  1.00000000,  0.66882516,
+      -0.51732223,  0.41419265,  0.57045333, -0.31505547, -0.26792500, -0.08499784, -0.56850143,  0.66882516,  1.00000000
+    ),
+    nrow = 9, byrow = TRUE,
+    dimnames = list(
+      c("db", "wr_3b", "wr_15b", "ilr1", "ilr2", "rfv", "ph", "cec", "soc"),
+      c("db", "wr_3b", "wr_15b", "ilr1", "ilr2", "rfv", "ph", "cec", "soc")
+    )
+  ),
+  # Correlation matrix for horizon "A"
+  A = matrix(
+    c(
+      1.000000000, -0.55439855, -0.30676807,  0.00579944,  0.22604118, -0.23494390,  0.28924236, -0.24607414, -0.59785849,
+      -0.554398551,  1.00000000,  0.70474039,  0.26778122,  0.23322760,  0.05418865, -0.16050394,  0.65092444,  0.72818243,
+      -0.306768070,  0.70474039,  1.00000000,  0.37170154,  0.51379283,  0.01042278, -0.06619693,  0.78959326,  0.65356089,
+      0.00579944,  0.26778122,  0.37170154,  1.00000000,  0.72010438, -0.16320326, -0.02896622,  0.40443225,  0.12493742,
+      0.22604118,  0.23322760,  0.51379283,  0.72010438,  1.00000000, -0.17448854,  0.18155797,  0.55809169,  0.07398179,
+      -0.23494390,  0.05418865,  0.01042278, -0.16320326, -0.17448854,  1.00000000, -0.08901404,  0.02119348,  0.14734088,
+      0.28924236, -0.16050394, -0.06619693, -0.02896622,  0.18155797, -0.08901404,  1.00000000,  0.02522550, -0.30913879,
+      -0.24607414,  0.65092444,  0.78959326,  0.40443225,  0.55809169,  0.02119348,  0.02522550,  1.00000000,  0.65618229,
+      -0.59785849,  0.72818243,  0.65356089,  0.12493742,  0.07398179,  0.14734088, -0.30913879,  0.65618229,  1.00000000
+    ),
+    nrow = 9, byrow = TRUE,
+    dimnames = list(
+      c("db", "wr_3b", "wr_15b", "ilr1", "ilr2", "rfv", "ph", "cec", "soc"),
+      c("db", "wr_3b", "wr_15b", "ilr1", "ilr2", "rfv", "ph", "cec", "soc")
+    )
+  ),
+  # Correlation matrix for horizon "E"
+  E = matrix(
+    c(
+      1.00000000, -0.72166635, -0.51086587, -0.24688881, -0.01484658, -0.09737253,  0.24553425, -0.46924747, -0.63692085,
+      -0.72166635,  1.00000000,  0.82433439,  0.50550190,  0.34972407,  0.08208646, -0.12533214,  0.66025070,  0.62582724,
+      -0.51086587,  0.82433439,  1.00000000,  0.48701806,  0.52512841,  0.07626109,  0.03699087,  0.76633798,  0.50911189,
+      -0.24688881,  0.50550190,  0.48701806,  1.00000000,  0.57113159, -0.00868065, -0.04520241,  0.52640485,  0.20132399,
+      -0.01484658,  0.34972407,  0.52512841,  0.57113159,  1.00000000, -0.00493262,  0.25745108,  0.55483009,  0.03833115,
+      -0.09737253,  0.08208646,  0.07626109, -0.00868065, -0.00493262,  1.00000000, -0.01652281,  0.15123166,  0.02809785,
+      0.24553425, -0.12533214,  0.03699087, -0.04520241,  0.25745108, -0.01652281,  1.00000000,  0.06014758, -0.25076110,
+      -0.46924747,  0.66025070,  0.76633798,  0.52640485,  0.55483009,  0.15123166,  0.06014758,  1.00000000,  0.58986496,
+      -0.63692085,  0.62582724,  0.50911189,  0.20132399,  0.03833115,  0.02809785, -0.25076110,  0.58986496,  1.00000000
+    ),
+    nrow = 9, byrow = TRUE,
+    dimnames = list(
+      c("db", "wr_3b", "wr_15b", "ilr1", "ilr2", "rfv", "ph", "cec", "soc"),
+      c("db", "wr_3b", "wr_15b", "ilr1", "ilr2", "rfv", "ph", "cec", "soc")
+    )
+  ),
+  # Correlation matrix for horizon "B"
+  B = matrix(
+    c(
+      1.00000000, -0.35430755, -0.07759279,  0.03861878,  0.36964723, -0.14324384,  0.14630083,  0.00314755, -0.44189733,
+      -0.35430755,  1.00000000,  0.71593596,  0.22681681,  0.18822336, -0.03117332, -0.07260227,  0.57071083,  0.63034148,
+      -0.07759279,  0.71593596,  1.00000000,  0.23009510,  0.37165844, -0.09761996, -0.02772721,  0.58423909,  0.46130320,
+      0.03861878,  0.22681681,  0.23009510,  1.00000000,  0.58729064, -0.20491330,  0.00628919,  0.35763991,  0.02222846,
+      0.36964723,  0.18822336,  0.37165844,  0.58729064,  1.00000000, -0.26577675,  0.13170032,  0.49623326, -0.10606100,
+      -0.14324384, -0.03117332, -0.09761996, -0.20491330, -0.26577675,  1.00000000, -0.14916302, -0.13954794,  0.05940412,
+      0.14630083, -0.07260227, -0.02772721,  0.00628919,  0.13170032, -0.14916302,  1.00000000,  0.15356674, -0.17595730,
+      0.00314755,  0.57071083,  0.58423909,  0.35763991,  0.49623326, -0.13954794,  0.15356674,  1.00000000,  0.42106925,
+      -0.44189733,  0.63034148,  0.46130320,  0.02222846, -0.10606100,  0.05940412, -0.17595730,  0.42106925,  1.00000000
+    ),
+    nrow = 9, byrow = TRUE,
+    dimnames = list(
+      c("db", "wr_3b", "wr_15b", "ilr1", "ilr2", "rfv", "ph", "cec", "soc"),
+      c("db", "wr_3b", "wr_15b", "ilr1", "ilr2", "rfv", "ph", "cec", "soc")
+    )
+  ),
+  # Correlation matrix for horizon "C"
+  C = matrix(
+    c(
+      1.00000000, -0.49444573, -0.12265485, -0.09124099,  0.08841398,  0.20183236,  0.04827676, -0.14375777, -0.25179777,
+      -0.49444573,  1.00000000,  0.66437943,  0.41933536,  0.35350081, -0.04373770, -0.00581066,  0.51228943,  0.45873202,
+      -0.12265485,  0.66437943,  1.00000000,  0.50758865,  0.65275789, -0.02967529,  0.04459002,  0.75132557,  0.35259488,
+      -0.09124099,  0.41933536,  0.50758865,  1.00000000,  0.65807237, -0.09901578,  0.14726758,  0.48722655,  0.19424051,
+      0.08841398,  0.35350081,  0.65275789,  0.65807237,  1.00000000, -0.13477712,  0.19654950,  0.60399050,  0.14396747,
+      0.20183236, -0.04373770, -0.02967529, -0.09901578, -0.13477712,  1.00000000, -0.17153086, -0.08772702,  0.03517571,
+      0.04827676, -0.00581066,  0.04459002,  0.14726758,  0.19654950, -0.17153086,  1.00000000,  0.12438964, -0.14343653,
+      -0.14375777,  0.51228943,  0.75132557,  0.48722655,  0.60399050, -0.08772702,  0.12438964,  1.00000000,  0.30258961,
+      -0.25179777,  0.45873202,  0.35259488,  0.19424051,  0.14396747,  0.03517571, -0.14343653,  0.30258961,  1.00000000
+    ),
+    nrow = 9, byrow = TRUE,
+    dimnames = list(
+      c("db", "wr_3b", "wr_15b", "ilr1", "ilr2", "rfv", "ph", "cec", "soc"),
+      c("db", "wr_3b", "wr_15b", "ilr1", "ilr2", "rfv", "ph", "cec", "soc")
+    )
+  ),
+  # Correlation matrix for horizon "Cr"
+  Cr = matrix(
+    c(
+      1.00000000, -0.72044033, -0.52483975,  0.03496264,  0.04054672,  0.09487819,  0.00103734, -0.38380679, -0.13547789,
+      -0.72044033,  1.00000000,  0.84526079,  0.23542788,  0.30096222,  0.02177639, -0.03462256,  0.64642946,  0.39934849,
+      -0.52483975,  0.84526079,  1.00000000,  0.26622642,  0.44313470,  0.00023241, -0.08761109,  0.76879664,  0.26954689,
+      0.03496264,  0.23542788,  0.26622642,  1.00000000,  0.71197524,  0.02258499,  0.19072608,  0.14252809,  0.10912838,
+      0.04054672,  0.30096222,  0.44313470,  0.71197524,  1.00000000,  0.03893177,  0.04514077,  0.26259324,  0.16548345,
+      0.09487819,  0.02177639,  0.00023241,  0.02258499,  0.03893177,  1.00000000, -0.18050233, -0.06426362,  0.19894328,
+      0.00103734, -0.03462256, -0.08761109,  0.19072608,  0.04514077, -0.18050233,  1.00000000, -0.00432937, -0.18227434,
+      -0.38380679,  0.64642946,  0.76879664,  0.14252809,  0.26259324, -0.06426362, -0.00432937,  1.00000000,  0.13793976,
+      -0.13547789,  0.39934849,  0.26954689,  0.10912838,  0.16548345,  0.19894328, -0.18227434,  0.13793976,  1.00000000
+    ),
+    nrow = 9, byrow = TRUE,
+    dimnames = list(
+      c("db", "wr_3b", "wr_15b", "ilr1", "ilr2", "rfv", "ph", "cec", "soc"),
+      c("db", "wr_3b", "wr_15b", "ilr1", "ilr2", "rfv", "ph", "cec", "soc")
+    )
+  )
+)
+
+# parameter order: sand_total, silt_total, clay_total
+# Create a list of correlation matrices for each horizon group
+global_cor_txt_matrices <- list(
+  O = matrix(
+    c(1.000000, -0.73562902, -0.71382397,
+      -0.735629,  1.00000000,  0.05163557,
+      -0.713824,  0.05163557,  1.00000000),
+    nrow = 3, byrow = TRUE,
+    dimnames = list(c("sand", "silt", "clay"), c("sand", "silt", "clay"))
+  ),
+  A = matrix(
+    c(1.000000, -0.810687, -0.680404,
+      -0.810687, 1.00000000,  0.123484,
+      -0.680404, 0.123484,  1.000000),
+    nrow = 3, byrow = TRUE,
+    dimnames = list(c("sand", "silt", "clay"), c("sand", "silt", "clay"))
+  ),
+  E = matrix(
+    c(1.0000000, -0.9525737, -0.6732157,
+      -0.9525737,  1.0000000,  0.4163249,
+      -0.6732157,  0.4163249,  1.0000000),
+    nrow = 3, byrow = TRUE,
+    dimnames = list(c("sand", "silt", "clay"), c("sand", "silt", "clay"))
+  ),
+  B = matrix(
+    c(1.0000000, -0.71362200, -0.66543094,
+      -0.7136220,  1.00000000, -0.04677102,
+      -0.6654309, -0.04677102,  1.00000000),
+    nrow = 3, byrow = TRUE,
+    dimnames = list(c("sand", "silt", "clay"), c("sand", "silt", "clay"))
+  ),
+  C = matrix(
+    c(1.0000000, -0.8387569, -0.7086493,
+      -0.8387569,  1.0000000,  0.2104033,
+      -0.7086493,  0.2104033,  1.0000000),
+    nrow = 3, byrow = TRUE,
+    dimnames = list(c("sand", "silt", "clay"), c("sand", "silt", "clay"))
+  ),
+  Cr = matrix(
+    c(1.0000000, -0.8462712, -0.7904204,
+      -0.8462712,  1.0000000,  0.3425646,
+      -0.7904204,  0.3425646,  1.0000000),
+    nrow = 3, byrow = TRUE,
+    dimnames = list(c("sand", "silt", "clay"), c("sand", "silt", "clay"))
+  )
+)
+
+```
+

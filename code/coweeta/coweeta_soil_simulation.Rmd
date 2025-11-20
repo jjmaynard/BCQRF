@@ -1,0 +1,813 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+-- parameters used by ROSETTA, may contain NULL
+sandtotal_r
+silttotal_r
+claytotal_r
+dbthirdbar_r
+wthirdbar_r/100 AS wthirdbar_decimal
+wfifteenbar_r/100 AS wfifteenbar_decimal
+
+Steps:
+1. Approximate SD for sand, silt, clay
+2. Calculate covariance matrix using SD and correlation matrix. Correlation matrices are precomputed at some set geographic extent.
+3. Simulate compositional soil texture distributions (n=1000) using rnorm.acomp()
+4. 'ilr' transform of simulated texture data. calculate mean and sd for ilr vectors
+5. Approximate SD for other soil properties
+6. Calculate covariance matrix of ilr vectors and other soil properties using SD and correlation matrix
+7. Generate soil profile realizations using mvrnorm function from MASS package
+8. Back transfrom ilr values
+
+```{r}
+library(aqp)
+library(lattice)
+library(tactile)
+library(reshape2)
+library(dplyr)
+library(MASS)
+library(soilDB)
+library(aqp)
+library(latticeExtra)
+library(DBI)
+library(RSQLite)
+library(compositions)
+library(ggplot2)
+library(here)
+```
+
+# SSURGO/RSS split
+```{r}
+pedon_data <- readRDS(here('data/combined-tab-data-SPC.rds'))
+
+hz_data <- pedon_data@horizons
+site_data <- pedon_data@site
+
+hz_data_sub <- hz_data |> dplyr::select(cokey,hzname, hzdept_r,hzdepb_r,sandtotal_l,sandtotal_r,sandtotal_h, silttotal_l,silttotal_r,silttotal_h,claytotal_l,claytotal_r,claytotal_h,dbthirdbar_l,dbthirdbar_r,dbthirdbar_h,wthirdbar_l,wthirdbar_r,wthirdbar_h,wfifteenbar_l,wfifteenbar_r,wfifteenbar_h)
+
+site_data_sub <- site_data |> dplyr::select(cokey, mukey, comppct_r, compname, source)
+site_data_sub_s <- site_data_sub |> dplyr::filter(source=='SSURGO')  
+site_data_sub_r <- site_data_sub |> dplyr::filter(source=='RSS') 
+
+data_sub_s <- site_data_sub_s |> dplyr::left_join(hz_data_sub, by="cokey")
+data_sub_r <- site_data_sub_r |> dplyr::left_join(hz_data_sub, by="cokey")
+
+```
+
+# processing functions
+```{r}
+# mean function
+mean_na <- function(x){
+  x_mean <- mean(x, na.rm=TRUE)
+  return(x_mean)
+}
+
+# R = correlation matrix, S = vector of standard deviations
+cor2cov <- function(R, S) {
+ sweep(sweep(R, 1, S, "*"), 2, S, "*")
+}
+
+#standard deviation approximation using the Ramirez and Cox method
+  #If sample number is unknown, defaults to 30 which approximates the standard 'Range Rule' where SD=range/4
+sd_aprox <- function(R, n=30){
+  SD =  R/(3*sqrt(log(n))-1.5)
+  return(SD)
+}
+
+# multivariate simulation of ROSETTA variables with number of simulations set by comppct_r
+multi_sim_hydro <- function(data, cor_matrix){
+  ssc <- compositions::acomp(data[, c('sandtotal_r', 'silttotal_r', 'claytotal_r')])
+  # nothing done here, but would safely compute the mean if nrow > 1
+  texture.mean <- compositions::meanCol(ssc)
+  
+  #simulate sand/silt/clay distributions independently
+  ssc.sim.range <- compositions::acomp(
+    cbind(
+      sand_range=rnorm(1000, mean=data$sandtotal_r, sd=sd_aprox((data$sandtotal_h-data$sandtotal_l))),
+      silt_range=rnorm(1000, mean=data$silttotal_r, sd=sd_aprox((data$silttotal_h-data$silttotal_l))),
+      clay_range=rnorm(1000, mean=data$claytotal_r, sd=sd_aprox((data$claytotal_h-data$claytotal_l)))
+    )
+  )
+
+  # compute the covariance matrix from a composition
+  texture.var <- var(ssc.sim.range)
+  
+  # simulate sand/silt/clay distributions as a composition
+  ssc.sim <- compositions::rnorm.acomp(n=1000, mean=texture.mean, var=texture.var)
+
+  # convert back to {0,100} scale for plotting
+  ssc.sim <- as.data.frame(unclass(ssc.sim) * 100)
+  sim.txt <- ssc.sim |> as.matrix()
+  sim_ilr <- ilr(sim.txt) |> as.data.frame() |> purrr::set_names("ilr1", "ilr2")
+  
+  # means and standard deviations, put properties into same order as correlation matrix.
+  ilr1_m <- mean(sim_ilr$ilr1)
+  ilr1_sd <- sd(sim_ilr$ilr1)
+  ilr2_m <- mean(sim_ilr$ilr2)
+  ilr2_sd <- sd(sim_ilr$ilr2)
+  db3bar_m <-  data$dbthirdbar_r
+  db3bar_sd <-  sd_aprox(data$dbthirdbar_h-data$dbthirdbar_l)
+  w3bar_m <-  data$wthirdbar_r
+  w3bar_sd <-  sd_aprox(data$wthirdbar_h-data$wthirdbar_l)
+  w15bar_m <-  data$wfifteenbar_r
+  w15bar_sd <-  sd_aprox(data$wfifteenbar_h-data$wfifteenbar_l)
+  means <- c(db3bar_m, w3bar_m, w15bar_m, ilr1_m, ilr2_m)
+  sd <- c(db3bar_sd, w3bar_sd, w15bar_sd, ilr1_sd, ilr2_sd)
+  
+  # calculate covariance matrix
+  cov_mat <- cor2cov(cor_matrix, sd) 
+  cov_mat=round(cov_mat,10)
+  
+  # multivariate simulation
+  multi_sim <- mvrnorm(data$comppct_r*10, mu=means, Sigma=cov_mat) |> as.data.frame()
+  txt_ilrInv <- ilrInv(rmult(as.matrix(cbind(multi_sim[,4],multi_sim[,5]))), orig=txt_acomp) |> as.data.frame() * 100
+  multi_sim <- cbind(multi_sim |> dplyr::select(-c(ilr1, ilr2)), txt_ilrInv)
+  return(multi_sim)
+}
+
+hz_quant_prob_mukey <- function(hz_data){
+  q = c(0.05, 0.5, 0.95)
+  data_out <- hz_data |> dplyr::select(mukey, top, sand=sand_total, silt=silt_total, clay=clay_total, Db=bulk_density_third_bar, wr3bar=water_retention_third_bar, wr15bar=water_retention_15_bar, theta_r, theta_s, alpha, npar, ksat)
+
+  data_stats05 <- data_out |> dplyr::group_by(mukey, top) |> dplyr::summarize(across(sand:ksat, ~quantile(.x, probs = q[1]))) |> as.data.frame()
+  data_stats50 <- data_out |> dplyr::group_by(mukey, top) |> dplyr::summarize(across(sand:ksat, ~quantile(.x, probs = q[2]))) |> as.data.frame()
+  data_stats95 <- data_out |> dplyr::group_by(mukey, top) |> dplyr::summarize(across(sand:ksat, ~quantile(.x, probs = q[3]))) |> as.data.frame()
+  data_statsPIW90 <- data_stats95 |> dplyr::select(-c(mukey)) - data_stats05 |> dplyr::select(-c(mukey))
+  data_statsPIW90 <- data_statsPIW90  |> dplyr::mutate(mukey=data_stats05$mukey, .before = top) |> dplyr::mutate(top=data_stats05$top)
+  data_stats05 <- data_stats05 |> purrr::set_names(c("mukey", "top", "sand_05", "silt_05", "clay_05", "db_05",  "wr3bar_05", "wr15bar_05", "theta_r_05", "theta_s_05", "alpha_05","npar_05", "ksat_05"))
+  data_stats50 <- data_stats50 |> purrr::set_names(c("mukey", "top", "sand_50", "silt_50", "clay_50", "db_50",  "wr3bar_50", "wr15bar_50", "theta_r_50", "theta_s_50", "alpha_50","npar_50", "ksat_50"))
+  data_stats95 <- data_stats95 |> purrr::set_names(c("mukey", "top", "sand_95", "silt_95", "clay_95", "db_95",  "wr3bar_95", "wr15bar_95", "theta_r_95", "theta_s_95", "alpha_95","npar_95", "ksat_95"))
+  data_statsPIW90 <- data_statsPIW90 |> purrr::set_names(c("mukey", "top", "sand_PIW90", "silt_PIW90", "clay_PIW90", "db_PIW90",  "wr3bar_PIW90", "wr15bar_PIW90", "theta_r_PIW90", "theta_s_PIW90", "alpha_PIW90","npar_PIW90", "ksat_PIW90"))
+  data_stats <- data_stats05 |> dplyr::left_join(data_stats50, by=c("mukey"="mukey", "top"="top"))
+  data_stats <- data_stats |> dplyr::left_join(data_stats95, by=c("mukey"="mukey", "top"="top"))
+  data_stats <- data_stats |> dplyr::left_join(data_statsPIW90, by=c("mukey"="mukey", "top"="top"))
+  data_stats <- data_stats |> dplyr::select(mukey, top, colnames(data_stats)[-1:-2][order(colnames(data_stats)[-1:-2])])
+  data_stats <- hz_data |> dplyr::select(mukey, top, bottom) |> dplyr::distinct() |> dplyr::left_join(data_stats, by=c("mukey"="mukey", "top"="top"))
+
+  #txt probabilities
+  txt_out <- data_out |> dplyr::select(mukey, top, SAND = sand, SILT = silt, CLAY = clay)
+  txt_out$txt_class <- soiltexture::TT.points.in.classes(tri.data=txt_out, class.sys="USDA-NCSS.TT", PiC.type="t")
+  txt_class_prob <- txt_out |> dplyr::group_by(mukey) |> dplyr::count(top, txt_class) |> dplyr::mutate(prob=n/10) |> dplyr::ungroup() |> dplyr::group_by(mukey,top)  |> dplyr::slice_max(prob, n=1) |> dplyr::ungroup() |> as.data.frame()
+  txt_class_prob <- hz_data |> dplyr::select(mukey, top, bottom) |> dplyr::distinct() |> dplyr::left_join(txt_class_prob, by=c("mukey"="mukey", "top"="top"))
+  data_stats <- data_stats |> dplyr::left_join(txt_class_prob |> dplyr::select(-c(n)), by=c("mukey"="mukey", "top"="top", "bottom"="bottom"))
+
+  return(data_stats)
+}
+
+mukey_sim_Rosseta <- function(mukey_data, cor_matrix){
+  #simulate across all components within mapunit
+  mukey_list <- list(list())
+  for(i in 1:nrow(mukey_data)){
+    data <- mukey_data[i,]
+    sim_data <- multi_sim_hydro(data, cor_matrix)
+    mukey_list[[i]] <- cbind(data |> dplyr::select(cokey, mukey, top, bottom), sim_data)
+  }
+  mukey_sim <- bind_rows(mukey_list)
+  mukey_sim <- mukey_sim |> dplyr::mutate(water_retention_third_bar = water_retention_third_bar/100, water_retention_15_bar = water_retention_15_bar/100)
+  rosetta_input <- mukey_sim |> dplyr::select(sand_total, silt_total, clay_total, bulk_density_third_bar, water_retention_third_bar, water_retention_15_bar)
+  vars <- c('sand_total', 'silt_total', 'clay_total', 'bulk_density_third_bar', 'water_retention_third_bar', 'water_retention_15_bar')
+  
+  # call ROSETTA API 
+  rosetta_sim <- soilDB::ROSETTA(rosetta_input, vars = vars)
+  mukey_sim_final <- cbind(mukey_sim, rosetta_sim |> dplyr::select(theta_r,theta_s,alpha,npar,ksat))
+}
+```
+
+# generate correlation matrix
+```{r}
+
+# connect
+db <- dbConnect(RSQLite::SQLite(), 'C:/R_Drive/Data_Files/LPKS_Data/Data/Soil_Pedon_Databases/NRCS/KSSL/LabDataMart_4-17-23/ncss_labdata.sqlite')
+
+dbListTables(db)
+
+lab_phy <- dbGetQuery(db, "SELECT * from lab_physical_properties;")
+
+# Calculate rock fragment volume
+# First, handle missing particle densities by assigning default values
+lab_phy <- lab_phy %>%
+  mutate(
+    particle_density_less_than_2mm = ifelse(
+      is.na(particle_density_less_than_2mm),
+      2.65,
+      particle_density_less_than_2mm
+    ),
+    particle_density_gt_2_mm = ifelse(
+      is.na(particle_density_gt_2_mm),
+      2.65,
+      particle_density_gt_2_mm
+    )
+  )
+
+# Handle missing bulk density values
+# You can choose which bulk density to use based on availability
+lab_phy <- lab_phy %>%
+  mutate(
+    bulk_density_used = ifelse(
+      !is.na(bulk_density_third_bar),
+      bulk_density_third_bar,
+      bulk_density_oven_dry
+    )
+  )
+
+# Perform the calculations
+lab_phy <- lab_phy %>%
+  rowwise() %>%
+  mutate(
+    # Total rock fragment weight percent
+    total_rf_wt_pct = total_frag_wt_pct_gt_2_mm_ws,
+    # Mass of rock fragments in grams (assuming 100 g total soil mass)
+    M_RF = total_rf_wt_pct,
+    # Mass of fine earth fraction in grams
+    M_FE = 100 - M_RF,
+    # Volume of rock fragments in cm³
+    V_RF = M_RF / particle_density_gt_2_mm,
+    # Volume of fine earth fraction in cm³
+    V_FE = M_FE / bulk_density_used,
+    # Total soil volume in cm³
+    V_Total = V_RF + V_FE,
+    # Volumetric rock fragment content (%)
+    Vol_RF_Pct = (V_RF / V_Total) * 100
+  ) %>%
+  ungroup()
+
+# extract physical properties
+phys_props <- lab_phy |> dplyr::select(clay_total, silt_total, sand_total, bulk_density_third_bar, water_retention_third_bar,water_retention_15_bar, rfv=Vol_RF_Pct)
+phys_props <- na.omit(phys_props)
+txt <- phys_props |> dplyr::select(sand_total, silt_total, clay_total) |> as.matrix()
+txt_acomp <- acomp(txt)
+txt_ilr <- ilr(txt_acomp) 
+txt_ilr <- txt_ilr |> as.data.frame() |> purrr::set_names("ilr1", "ilr2")
+cor_props_rfv <- cbind(phys_props, txt_ilr) |> dplyr::select(bulk_density_third_bar, water_retention_third_bar, water_retention_15_bar, ilr1,ilr2,rfv)
+cor_props <- cbind(phys_props, txt_ilr) |> dplyr::select(bulk_density_third_bar, water_retention_third_bar, water_retention_15_bar, ilr1,ilr2)
+txt_props <- phys_props |> dplyr::select(c(sand_total, silt_total, clay_total))
+                   
+# correlation matrix for bulk density, wr3bar, wr15bar
+global_cor_matrix_rfv <- cor(cor_props_rfv, method = "pearson", use = "complete.obs")
+global_cor_matrix <- cor(cor_props, method = "pearson", use = "complete.obs")
+txt_cor <- cor(txt_props, method = "pearson", use = "complete.obs")
+
+saveRDS(phys_props, here::here('data/phys_props.Rds'))
+
+```
+
+# RSS
+```{r}
+#Remove O, R and Cr horizons
+
+data_sub_r_mineral <- data_sub_r |> dplyr::filter(!is.na(sandtotal_r))
+
+data_sub_r_mineral <- data_sub_r_mineral |> dplyr::group_by(cokey) |> dplyr::mutate(depth_adj = min(hzdept_r)) |> mutate(hzdept_r = hzdept_r - depth_adj, hzdepb_r = hzdepb_r - depth_adj) |> ungroup()
+
+data_aqp <- data_sub_r_mineral |> dplyr::select(cokey, hzdept_r, hzdepb_r, sandtotal_l, sandtotal_r, sandtotal_h, silttotal_l, silttotal_r, silttotal_h, claytotal_l, claytotal_r, claytotal_h, dbthirdbar_l, dbthirdbar_r, dbthirdbar_h, wthirdbar_l, wthirdbar_r, wthirdbar_h, wfifteenbar_l, wfifteenbar_r, wfifteenbar_h)
+
+depths(data_aqp) <-  cokey ~ hzdept_r  + hzdepb_r 
+
+prof.slab.r <- aqp::slab(data_aqp, fm = cokey ~ sandtotal_r + silttotal_r + claytotal_r + dbthirdbar_r + wthirdbar_r + wfifteenbar_r, slab.structure=c(0,5,15,30,60,100), slab.fun=mean_na)
+prof.slab.r.1 <- prof.slab.r |> dplyr::select(-c(contributing_fraction)) |> tidyr::pivot_wider(names_from=variable, values_from=value)
+prof.slab.r.1[ is.na(prof.slab.r.1) ] <- NA
+
+prof.slab.l <- aqp::slab(data_aqp, fm = cokey ~ cokey ~ sandtotal_l + silttotal_l + claytotal_l + dbthirdbar_l + wthirdbar_l + wfifteenbar_l, slab.structure=c(0,5,15,30,60,100), slab.fun=mean_na)
+prof.slab.l.1 <- prof.slab.l |> dplyr::select(-c(contributing_fraction)) |> tidyr::pivot_wider(names_from=variable, values_from=value)
+prof.slab.l.1[ is.na(prof.slab.l.1) ] <- NA
+
+prof.slab.h <- aqp::slab(data_aqp, fm = cokey ~ cokey ~ sandtotal_h + silttotal_h + claytotal_h + dbthirdbar_h + wthirdbar_h + wfifteenbar_h, slab.structure=c(0,5,15,30,60,100), slab.fun=mean_na)
+prof.slab.h.1 <- prof.slab.h |> dplyr::select(-c(contributing_fraction)) |> tidyr::pivot_wider(names_from=variable, values_from=value)
+prof.slab.h.1[ is.na(prof.slab.h.1) ] <- NA
+
+prof_slab <- prof.slab.r.1 |> left_join(prof.slab.l.1, by=c("cokey", "top", "bottom")) |> left_join(prof.slab.h.1, by=c("cokey", "top", "bottom"))
+
+rss_slab <- prof_slab |> distinct() |> dplyr::filter(!is.na(sandtotal_r))
+
+rss_slab <- rss_slab |> dplyr::left_join(data_sub_r_mineral |> dplyr::select(cokey, mukey, comppct_r,compname, source), by="cokey") |> distinct() 
+
+```
+
+```{r}
+mukey_list <- unique(rss_slab$mukey)
+mukey_sim_list <- list(list())
+for(i in 1:length(mukey_list)){
+  mukey_data <- rss_slab |> dplyr::filter(mukey==mukey_list[i])
+  mukey_sim_list[[i]] <- mukey_sim_Rosseta(mukey_data, cor_matrix)
+}
+mukey_sim <- bind_rows(mukey_sim_list)
+saveRDS(mukey_sim, here::here('mukey_rosetta_simulations.Rds'))
+mukey_sim <- readRDS(here::here('data/mukey_rosetta_simulations.Rds'))
+
+mukey_sim <- mukey_sim |> dplyr::mutate(layerID = paste0(cokey,"_",top))
+
+
+
+mukey_prob_stats <- hz_quant_prob_mukey(mukey_sim)
+mukey_prob_stats$txt_class <- as.factor(mukey_prob_stats$txt_class)
+
+## ensure that factor levels / ordering are not lost in subsequent steps
+# use integer codes
+mukey_prob_stats$txt_class.numeric <- as.numeric(mukey_prob_stats$txt_class)
+
+```
+
+
+```{r}
+
+mukey_sim_dplot <- mukey_sim |> dplyr::select(sand=sand_total, silt=silt_total, clay=clay_total, db=bulk_density_third_bar, wr_fc=water_retention_third_bar, wr_pwp=water_retention_15_bar, cokey) |> left_join(rss_slab |> dplyr::select(cokey, compname, mukey), by="cokey")
+
+mukey_jpd <- mukey_sim_dplot |> dplyr::filter(mukey=="3244721") |> dplyr::select(-c(cokey, mukey, silt,sand, wr_fc))
+
+library(reticulate) #the superpower bridges python and R
+
+#importing required Python libraries/modules
+sns <- import('seaborn')
+plt <- import('matplotlib.pyplot')
+pd <- import('pandas')
+
+#building a seaborn pairplot using pairplot()
+plt$subplots_adjust(bottom=0.3)
+fig = sns$pairplot(r_to_py(mukey_jpd), hue = 'compname')
+#display the plot
+fig$tight_layout()
+plt$show()
+```
+
+# make maps
+```{r}
+library(terra)
+library(aqp)
+library(viridisLite)
+library(terra)
+library(rayshader)
+
+
+## 10m mukey grids (UTM z17), same grid topology
+r <- rast('grids/rss_utm.tif')
+## extract RATs
+r.rat <- cats(r)[[1]]
+## merge with combined mukey_prob_stats
+r.rat <- merge(r.rat, mukey_prob_stats |> dplyr::filter(top==0), by = 'mukey', all.x = TRUE, sort = FALSE) |> dplyr::distinct()
+## re-pack updated RATs
+levels(r) <- r.rat
+## convert RATE columns -> raster layers
+rr <- catalyze(r)
+# watershed
+w_sf <- sf::read_sf('vect/Coweeta_Hydrologic_Laboratory.shp') |> as('Spatial')
+
+#ksat
+ksat <- rr[[17:20]]
+p <- levelplot(ksat, names.attr= c("Ksat-P05", "Ksat-P50", "Ksat-P95", "Ksat-PIW90") )
+Cairo::CairoPDF("Coweeta_ksat.pdf",
+         8,  5, bg = "transparent")
+p + latticeExtra::layer(sp::sp.polygons(w_sf, col = 'grey40', lwt=52))
+dev.off()
+
+clay <- rr[[9:12]]
+p <- levelplot(clay, names.attr= c("Clay-P05", "Clay-P50", "Clay-P95", "Clay-PIW90") )
+Cairo::CairoPDF("Coweeta_clay.pdf",
+         8,  5, bg = "transparent")
+p + latticeExtra::layer(sp::sp.polygons(w_sf, col = 'grey40', lwt=2))
+dev.off()
+
+db <- rr[[13:16]]
+p <- levelplot(db, names.attr= c("Db-P05", "Db-P50", "Db-P95", "Db-PIW90") )
+Cairo::CairoPDF("Coweeta_Db.pdf",
+         8,  5, bg = "transparent")
+p + latticeExtra::layer(sp::sp.polygons(w_sf, col = 'grey40', lwt=2))
+dev.off()
+plot(rr['ksat_50'], col = r.rat$col, legend = FALSE, axes = FALSE, mar = c(1, 1, 1, 1))
+lines(w, col = 'white')
+
+png(file = 'overlay-ksat0-legend.png', width = ncol(o), height = nrow(o))
+plot(rr['ksat_50'], col = mako(25), legend = TRUE, axes = FALSE, maxcell = ncell(o), mar = c(0, 0, 0, 0))
+lines(w, col = 'white')
+dev.off()
+
+tt <- brick(x[[2]], x[[3]]-x[[1]])
+
+names(x) <- paste0("(", LETTERS[1:4], ")")
+terra::panel(rr[c('ksat_05','ksat_50','ksat_95')])
+panel(x, fun=\()lines(v), loc.main="topright")
+
+
+# local DEM to crop
+# UTM
+e <- raster::raster('grids/elev_pcs.tif')
+# prepare DEM for rayshader
+elmat <- raster_to_matrix(e)
+
+# watershed
+w <- vect('vect/Coweeta_Hydrologic_Laboratory.shp')
+
+# other thematic data for overlays
+o <- rast('grids/SWI.tif')
+
+# bbox
+b <- as.polygons(ext(e))
+crs(b) <- crs(e)
+
+# transform BBOX -> 5070
+b <- project(b, 'epsg:5070')
+
+# thematic map, as PNG, exact same dimensions
+ov <- png::readPNG('overlay-SWI.png')
+ksat_ov <- png::readPNG('overlay-ksat.png')
+
+# compute shadows
+raymat <- ray_shade(elmat, multicore = TRUE, progbar = TRUE, zscale = 0.1)
+ambmat <- ambient_shade(elmat, multicore = TRUE, progbar = TRUE, zscale = 0.1)
+
+
+## testing
+elmat %>%
+  sphere_shade(texture = "imhof4") %>%
+  add_shadow(raymat) %>%
+  add_shadow(ambmat) %>%
+  # add_overlay(ov, alphalayer = 0.9) %>%
+  plot_map()
+
+
+
+
+# theta (z-axis rotation)
+# phi (azimuth)
+
+# camera parameters
+.theta <- 160
+.phi <- 40
+.zoom <- 0.7
+.fov <- 48
+
+## output size
+px.width <- 1200
+px.height <- 800
+
+
+elmat %>%
+  sphere_shade(texture = "imhof4") %>%
+  add_shadow(raymat) %>%
+  add_shadow(ambmat) %>%
+  add_overlay(ksat_ov, alphalayer = 0.9) %>%
+  plot_3d(elmat, zscale = 10, windowsize = c(px.width, px.height),
+          baseshape = 'rectangle', lineantialias = TRUE,
+          theta = .theta, phi = .phi, zoom = .zoom, fov = .fov)
+
+
+
+## adjust until right
+# render_camera(theta = 160, phi = 40, zoom = 0.7, fov = 48)
+
+render_snapshot(
+  filename = 'SWI-block-diagram.png', clear = TRUE, 
+  instant_capture = TRUE
+)
+
+
+
+## do this after a session, to clear rgl device
+rgl::rgl.close()
+```
+
+```{r}
+# Run VG model over ROSETTA simulations by depth
+  # create or find layer index
+  # 1. subset simulation for cokey/depth
+
+# iterate over results and generate VG model curve
+VG_sim <- lapply(1:nrow(mukey_sim), function(i) {
+  
+  # model bounds are given in kPA of suction
+  vg <- KSSL_VG_model(VG_params = mukey_sim[i, ], phi_min = 10^-3, phi_max=10^6)
+  
+  # extract curve and add texture ID
+  m <- vg$VG_curve
+  m$layerID <- mukey_sim$layerID[i]
+  
+  # save model version
+  # m$.rosetta.version <- r$.rosetta.version[i]
+  
+  return(m)
+})
+
+# flatten to data.frame
+VG_sim_df <- do.call('rbind', VG_sim)
+saveRDS(VG_sim_df, here::here('VG_simulations.Rds'))
+
+
+
+mu_data <- rss_slab |> dplyr::select(cokey, mukey, top, bottom, compname) |> dplyr::mutate(layerID = paste0(cokey,"_",top))
+  
+  
+VG_sim_df_top <-  VG_sim_df[grep("_0", VG_sim_df$layerID), ]
+VG_sim_df_top <-  VG_sim_df_top |> left_join(mu_data, by="layerID")
+
+VG_sim_df_top_quant <- VG_sim_df_top |> dplyr::group_by(compname, phi) |> summarise(theta = quantile(theta, c(0.05, 0.50, 0.95)), prob = c(0.05, 0.50, 0.95)) |> ungroup() |> as.data.frame() |> tidyr::pivot_wider(names_from = prob, values_from = theta)
+  
+
+# set factor levels / labels for model version
+# res$version <- factor(res$.rosetta.version, levels = c('1', '2', '3'), labels = c('ROSETTA 1', 'ROSETTA 2', 'ROSETTA 3'))
+
+
+# plot style adjustments
+tps <- tactile.theme(
+  plot.line=list(col='royalblue', lwd = 2) 
+)
+
+
+# plot median +/i bounds defined by the 5th and 95th percentiles
+# this is lattice graphics, syntax is a little rough
+xyplot(phi ~ `0.5` | compname, data = VG_sim_df_top_quant, 
+             type = c('l', 'g'), 
+             ylab = expression(Matric~~Potential~~(-kPa)), 
+             xlab = expression(Volumetric~Water~Content~~(cm^3/cm^3)), 
+             lower=VG_sim_df_top_quant$`0.05`, upper=VG_sim_df_top_quant$`0.95`,
+             panel=panel.depth_function,
+             alpha=0.25, sync.colors=TRUE,
+             par.settings=tps,
+             prepanel=prepanel.depth_function,
+             layout=c(6, 3), strip=strip.custom(bg=grey(0.85)),
+             auto.key = list(lines = TRUE, points = FALSE, columns = 3),
+             as.table = TRUE,
+             scales = list(alternating=3, x=list(at=seq(0.1,0.5,0.2),tick.number=3), y=list(log=10, tick.number=6)), 
+             yscale.components = yscale.components.logpower,
+             main = 'Simulated Water Retention'
+             )
+
+
+
+
+```
+
+# Approximate AWC
+
+```{r}
+# iterate over results
+# generate VG model curve
+# compute a simplistic AWC
+awc <- lapply(1:nrow(mukey_sim), function(i) {
+  
+  # model bounds are given in kPA of suction
+  vg <- KSSL_VG_model(VG_params = mukey_sim[i, ], phi_min = 10^-3, phi_max=10^6)
+  
+  # extract VWC at specific matric potentials (kPa)
+  d <- data.frame(
+    layerID = mukey_sim$layerID[i], 
+    sat = vg$VG_function(0),
+    fc = vg$VG_function(33),
+    pwp = vg$VG_function(1500)
+  )
+  
+  # simplistic determination of AWC using 33 kPa -> 1500 kPa interval
+  d$awc <- with(d, fc - pwp)
+
+  
+  return(d)
+})
+
+awc <- do.call('rbind', awc)
+awc_cokey <-  awc |> left_join(mu_data, by="layerID")
+
+awc_quant <- awc_cokey |> dplyr::group_by(mukey, top) |> summarise(awc_quant = quantile(awc, c(0.05, 0.50, 0.95)), prob = c(0.05, 0.50, 0.95)) |> ungroup() |> as.data.frame() |> tidyr::pivot_wider(names_from = prob, values_from = awc_quant)
+
+awc_mukey_quant <-  awc_quant |> left_join(mu_data |> dplyr::select(mukey, top, bottom), by=c("mukey"="mukey", "top"="top")) |> dplyr::distinct()
+awc_mukey_quant <- awc_mukey_quant |> dplyr::mutate(depth = bottom - top)
+awc_mukey_aws50_100 <- awc_mukey_quant |> dplyr::group_by(mukey) |> summarise(aws = sum(`0.5`*depth))
+awc_mukey_aws05_100 <- awc_mukey_quant |> dplyr::group_by(mukey) |> summarise(aws = sum(`0.05`*depth))
+awc_mukey_aws95_100 <- awc_mukey_quant |> dplyr::group_by(mukey) |> summarise(aws = sum(`0.95`*depth))
+awc_mukey_aws <- awc_mukey_aws50_100 |> dplyr::left_join(awc_mukey_aws05_100, by='mukey')|> dplyr::left_join(awc_mukey_aws95_100, by='mukey') |> purrr::set_names(c("mukey", "aws50_100", "aws05_100", "aws95_100"))
+awc_mukey_aws <- awc_mukey_aws |> dplyr::mutate(mukey = as.numeric(mukey))
+awc_mukey_aws$PIW90 <- awc_mukey_aws$aws95_100 - awc_mukey_aws$aws05_100
+## 10m mukey grids (UTM z17), same grid topology
+r <- terra::rast(here::here('data/grids/rss_utm.tif'))
+
+r_vals <- terra::values(r) |> as.data.frame() |> purrr::set_names("mukey") #|> dplyr::mutate(mukey = as.character(mukey))
+r_vals <- r_vals |> left_join(awc_mukey_aws, by='mukey') 
+r_stack <- c(r,r,r,r, r)
+terra::values(r_stack) <- r_vals |> as.matrix()
+names(r_stack) <- c("mukey", "aws50_100", "aws05_100", "aws95_100", "PIW90")
+
+
+# dotplot(
+#   factor(.rosetta.version) ~ awc | layer, data = awc,
+#   ylab = 'Layer', 
+#   scales = list(alternating = 1, x = list(tick.number = 5, cex = 0.66, rot = 90)), 
+#   xlab = expression(AWC~~(cm^3/cm^3)), 
+#   par.settings = tps, 
+#   strip = strip.custom(bg=grey(0.85)), 
+#   as.table = TRUE,
+#   layout = c(7, 3),
+#   main='Simplistic AWC (FC - PWP)',
+#   panel = function(...) {
+#     panel.abline(v = seq(0, 0.25, by = 0.05), col = trellis.par.get()$dot.line$col)
+#     panel.dotplot(...)
+#   }
+# )
+```
+
+```{r}
+#plot aws overlays
+library(terra)
+library(rayshader)
+library(viridisLite)
+
+
+# local DEM to crop
+# UTM
+elv <- rast(here::here('data/dss_coweeta/grids/elev_pcs.tif'))
+
+# watershed
+w <- vect(here::here('data/vect/Coweeta_Hydrologic_Laboratory.shp'))
+
+# other thematic data for overlays
+o <- rast(here::here('data/dss_coweeta/grids/SWI.tif'))
+
+# bbox
+b <- as.polygons(ext(e))
+crs(b) <- crs(e)
+
+
+
+# crop soil color
+#r_stack_crop <- terra::crop(r_stack, b)
+
+# save as overlay image
+png(file = 'overlay-aws_50q_revised.png', width = ncol(r_stack[[2]]), height = nrow(r_stack[[2]]))
+plot(r_stack[[2]], col = rev(mako(25)), legend = FALSE, axes = FALSE, maxcell = terra::ncell(r_stack[[2]]), mar = c(0, 0, 0, 0), range=c(0,15))
+lines(w, col = 'white')
+dev.off()
+
+# save as overlay image
+png(file = 'overlay-aws_05q_revised.png', width = ncol(r_stack[[3]]), height = nrow(r_stack[[3]]))
+plot(r_stack[[3]], col = rev(mako(25)), legend = FALSE, axes = FALSE, maxcell = terra::ncell(r_stack[[3]]), mar = c(0, 0, 0, 0), range=c(0,10))
+lines(w, col = 'white')
+dev.off()
+
+# save as overlay image
+png(file = 'overlay-aws_95q_revised.png', width = ncol(r_stack[[4]]), height = nrow(r_stack[[4]]))
+plot(r_stack[[4]], col = rev(mako(25)), legend = FALSE, axes = FALSE, maxcell = terra::ncell(r_stack[[4]]), mar = c(0, 0, 0, 0), range=c(0,15))
+lines(w, col = 'white')
+dev.off()
+
+# save as overlay image
+png(file = 'overlay-aws_90PIW_revised.png', width = ncol(r_stack[[5]]), height = nrow(r_stack[[5]]))
+plot(r_stack[[5]], col = rev(mako(25)), legend = FALSE, axes = FALSE, maxcell = terra::ncell(r_stack[[5]]), mar = c(0, 0, 0, 0), range=c(4,12))
+lines(w, col = 'white')
+dev.off()
+
+e <- c(275000, 279000, 3877200, 3877500)
+png(file = 'legend-aws_revised.png', width = ncol(r_stack[[2]]), height = nrow(r_stack[[2]]))
+plot(r_stack[[2]], col = rev(mako(25)), mar = c(7.1, 3.1, 2.1, 3.1), range=c(0,10), plg = list(ext = e, loc = "bottom"))
+dev.off()
+
+e <- c(275000, 279000, 3877200, 3877500)
+png(file = 'legend-aws_PIWrevised.png', width = ncol(r_stack[[2]]), height = nrow(r_stack[[2]]))
+plot(r_stack[[2]], col = rev(mako(25)), mar = c(7.1, 3.1, 2.1, 3.1), range=c(4,12), plg = list(ext = e, loc = "bottom"))
+dev.off()
+
+# prepare DEM for rayshader
+elmat <- raster_to_matrix(elv)
+
+
+# thematic map, as PNG, exact same dimensions
+aws50 <- png::readPNG('overlay-aws_50q_revised.png')
+aws05 <- png::readPNG('overlay-aws_05q_revised.png')
+aws95 <- png::readPNG('overlay-aws_95q_revised.png')
+awsPIW90 <- png::readPNG('overlay-aws_90PIW_revised.png')
+# compute shadows
+raymat <- ray_shade(elmat, multicore = TRUE, progbar = TRUE, zscale = 0.1)
+ambmat <- ambient_shade(elmat, multicore = TRUE, progbar = TRUE, zscale = 0.1)
+
+
+## testing
+elmat %>%
+  sphere_shade(texture = "imhof4") %>%
+  add_shadow(raymat) %>%
+  add_shadow(ambmat) %>%
+  add_overlay(aws50, alphalayer = 0.9) %>%
+  plot_map()
+
+
+
+
+# theta (z-axis rotation)
+# phi (azimuth)
+
+# camera parameters
+.theta <- 160
+.phi <- 40
+.zoom <- 0.7
+.fov <- 48
+
+## output size
+px.width <- 1200
+px.height <- 800
+
+
+elmat %>%
+  sphere_shade(texture = "imhof4") %>%
+  add_shadow(raymat) %>%
+  add_shadow(ambmat) %>%
+  add_overlay(aws50, alphalayer = 0.9) %>%
+  plot_3d(elmat, zscale = 10, windowsize = c(px.width, px.height),
+          baseshape = 'rectangle', lineantialias = TRUE,
+          theta = .theta, phi = .phi, zoom = .zoom, fov = .fov)
+
+## adjust until right
+render_camera(theta = 160, phi = 40, zoom = 0.7, fov = 48)
+
+render_snapshot(
+  filename = 'AWS50-block-diagram.png', clear = TRUE, 
+  instant_capture = TRUE
+)
+
+#-------------------------------
+elmat %>%
+  sphere_shade(texture = "imhof4") %>%
+  add_shadow(raymat) %>%
+  add_shadow(ambmat) %>%
+  add_overlay(aws50, alphalayer = 0.9) %>%
+  plot_3d(elmat, zscale = 10, windowsize = c(px.width, px.height),
+          baseshape = 'rectangle', lineantialias = TRUE,
+          theta = .theta, phi = .phi, zoom = .zoom, fov = .fov)
+
+
+## adjust until right
+render_camera(theta = 160, phi = 40, zoom = 0.7, fov = 48)
+
+render_snapshot(
+  filename = 'AWS-P50-block-diagram.png', clear = TRUE, 
+  instant_capture = TRUE
+)
+
+#-------------------------------
+elmat %>%
+  sphere_shade(texture = "imhof4") %>%
+  add_shadow(raymat) %>%
+  add_shadow(ambmat) %>%
+  add_overlay(aws05, alphalayer = 0.9) %>%
+  plot_3d(elmat, zscale = 10, windowsize = c(px.width, px.height),
+          baseshape = 'rectangle', lineantialias = TRUE,
+          theta = .theta, phi = .phi, zoom = .zoom, fov = .fov)
+
+
+## adjust until right
+render_camera(theta = 160, phi = 40, zoom = 0.7, fov = 48)
+
+render_snapshot(
+  filename = 'AWS-P05-block-diagram.png', clear = TRUE, 
+  instant_capture = TRUE
+)
+
+#-------------------------------
+elmat %>%
+  sphere_shade(texture = "imhof4") %>%
+  add_shadow(raymat) %>%
+  add_shadow(ambmat) %>%
+  add_overlay(aws95, alphalayer = 0.9) %>%
+  plot_3d(elmat, zscale = 10, windowsize = c(px.width, px.height),
+          baseshape = 'rectangle', lineantialias = TRUE,
+          theta = .theta, phi = .phi, zoom = .zoom, fov = .fov)
+
+
+## adjust until right
+render_camera(theta = 160, phi = 40, zoom = 0.7, fov = 48)
+
+render_snapshot(
+  filename = 'AWS-P95-block-diagram.png', clear = TRUE, 
+  instant_capture = TRUE
+)
+
+
+#-------------------------------
+elmat %>%
+  sphere_shade(texture = "imhof4") %>%
+  add_shadow(raymat) %>%
+  add_shadow(ambmat) %>%
+  add_overlay(awsPIW90, alphalayer = 0.9) %>%
+  plot_3d(elmat, zscale = 10, windowsize = c(px.width, px.height),
+          baseshape = 'rectangle', lineantialias = TRUE,
+          theta = .theta, phi = .phi, zoom = .zoom, fov = .fov)
+
+
+## adjust until right
+render_camera(theta = 160, phi = 40, zoom = 0.7, fov = 48)
+
+render_snapshot(
+  filename = 'AWS-PIW90-block-diagram.png', clear = TRUE, 
+  instant_capture = TRUE
+)
+
+
+
+
+
+
+
+## do this after a session, to clear rgl device
+rgl::rgl.close()
+```
+
+```{r}
+save.image('Coweeta_Soil_Simulation.RData')
+load(here::here('data/Coweeta_Soil_Simulation.RData'))
+```
+

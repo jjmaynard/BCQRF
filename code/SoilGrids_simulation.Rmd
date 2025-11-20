@@ -1,0 +1,1642 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+# Load required libraries
+library(sf)
+library(rgdal)
+library(readr)
+library(aqp)
+library(soilDB)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(leaflet)
+```
+
+
+
+
+
+```{r}
+#' Process Soil Profile Data
+#'
+#' This function takes a SoilGrids or similar soil profile object `x` (with a slot `@horizons`)
+#' and performs the following steps:
+#' /enumerate{
+#'   /item Reshapes horizon data from wide to long format, pivoting quantile columns (Q05, Q50, Q95, mean, uncertainty).
+#'   /item Summarizes Q05 and Q95 per property (forming "bounds_summary").
+#'   /item Expands these Q05–Q95 bounds by a user-defined scaling factor (default 0.2 = 20/%).
+#'   /item Clamps lower bounds to 0 if negative; clamps upper bounds at 100 for /code{clay, silt, sand}.
+#'   /item Creates a property-specific named list of [min, max] bounds.
+#'   /item Row-wise extrapolates each horizon’s min/max using /code{extrapolate_min_max_bounded()}.
+#'   /item Renames columns Q05->P05, Q50->P50, Q95->P95, min_est->P0, max_est->P100.
+#'   /item Returns the final long data frame with these extra columns.
+#' }
+#'
+#' @param x A soil profile object (or similar) with a /code{@horizons} slot containing columns:
+#'   /code{label, id, hzdept, hzdepb, hzID, ... Q05, Q50, Q95, mean, uncertainty}.
+#' @param scaling_factor Numeric, the proportion by which to expand Q05–Q95 ranges before clamping,
+#'   defaults to /code{0.2} (i.e., 20/%).
+#'
+#' @return A /code{data.frame} (or tibble) in long format, containing columns:
+#'   /code{id, hzdept, hzdepb, hzID, property, P05, P50, P95, mean, P0, P100}.
+#'
+#' @import dplyr tidyr
+#' @export
+process_soil_profile_data <- function(x, scaling_factor = 0.2) {
+  # Ensure required packages are loaded
+  requireNamespace("dplyr", quietly = TRUE)
+  requireNamespace("tidyr", quietly = TRUE)
+  
+  # Define internal helper function if not already defined
+  extrapolate_min_max_bounded <- function(q5, q50, q95, k = 0.2, prop_name, bounds_list) {
+    # 1) Basic extrapolation
+    min_est <- q5  - k * (q50 - q5)
+    max_est <- q95 + k * (q95 - q50)
+    
+    # 2) Clamp to physical bounds
+    valid_range <- bounds_list[[prop_name]]
+    min_bound   <- valid_range[1]
+    max_bound   <- valid_range[2]
+    
+    min_est_bounded <- max(min_est, min_bound)
+    max_est_bounded <- min(max_est, max_bound)
+    
+    return(c(min_est = min_est_bounded, max_est = max_est_bounded))
+  }
+  
+  # 1) Create a long format profile
+  profile <- x@horizons
+  profile_long <- profile %>%
+    tidyr::pivot_longer(
+      cols = -c(label, id, hzdept, hzdepb, hzID),
+      names_to = c("property", "stat"),
+      names_pattern = "^(.*?)(Q05|Q50|Q95|mean|uncertainty)$",
+      values_to = "value"
+    ) %>%
+    tidyr::pivot_wider(
+      names_from = stat,
+      values_from = value
+    ) %>%
+    dplyr::select(-label, -uncertainty)
+  
+  # 2) Summarize Q05 and Q95 values
+  bounds_summary <- profile_long %>%
+    dplyr::group_by(property) %>%
+    dplyr::summarise(
+      min_Q05 = min(Q05, na.rm = TRUE),  # Minimum of Q05
+      max_Q95 = max(Q95, na.rm = TRUE),  # Maximum of Q95
+      n       = dplyr::n()              # Count of rows per property
+    )
+  
+  # 3) Expand Q05–Q95 range by scaling_factor
+  property_bounds_df <- bounds_summary %>%
+    dplyr::mutate(
+      range_diff    = max_Q95 - min_Q05,
+      realistic_min = min_Q05 - scaling_factor * range_diff,
+      realistic_max = max_Q95 + scaling_factor * range_diff
+    )
+  
+  # 4) Clamp realistic_min to 0 if negative
+  property_bounds_df <- property_bounds_df %>%
+    dplyr::mutate(
+      realistic_min = dplyr::if_else(realistic_min < 0, 0, realistic_min)
+    )
+  
+  # 5) Clamp realistic_max to 100 for clay, silt, sand
+  property_bounds_df <- property_bounds_df %>%
+    dplyr::mutate(
+      realistic_max = dplyr::case_when(
+        property %in% c("clay", "silt", "sand") & realistic_max > 100 ~ 100,
+        TRUE ~ realistic_max
+      )
+    )
+  
+  # 6) Convert property bounds into a named list of [min, max] for each property
+  property_bounds_list <- setNames(
+    Map(
+      function(lo, hi) c(lo, hi),
+      property_bounds_df$realistic_min,
+      property_bounds_df$realistic_max
+    ),
+    property_bounds_df$property
+  )
+  
+  # 7) Row-wise extrapolate each horizon
+  profile_long_bounded <- profile_long %>%
+    dplyr::rowwise() %>%
+    dplyr::mutate(
+      out = list(extrapolate_min_max_bounded(
+        q5         = Q05,
+        q50        = Q50,
+        q95        = Q95,
+        k          = scaling_factor,
+        prop_name  = property,
+        bounds_list = property_bounds_list
+      )),
+      min_est = .data$out["min_est"],
+      max_est = .data$out["max_est"]
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(-out)
+  
+  # 8) Rename columns for clarity
+  profile_long_bounded <- profile_long_bounded %>%
+    dplyr::rename(
+      P05   = Q05,
+      P50   = Q50,
+      P95   = Q95,
+      P0    = min_est,
+      P100  = max_est
+    )
+  
+  # Return the final data
+  return(profile_long_bounded)
+}
+
+
+#' Generate a Density-Based Distribution from Dataframe Quantiles or Percentiles
+#'
+#' This function creates a simulated distribution based on the quantiles or percentiles provided
+#' in a dataframe. You can pass in any combination of percentile column names (e.g., P0, P5, P50, P95, P100).
+#' If all of these columns are absent or contain -1, it falls back to standard quartiles (Min, Quart1, Median, Quart3, Max).
+#' The function simulates dense points around each quantile/percentile using truncated normal distributions,
+#' then applies Kernel Density Estimation (KDE) to refine the distribution, truncating to fit
+#' within the provided minimum and maximum bounds.
+#'
+#' @param quantile_df A dataframe containing columns for quantiles/percentiles.
+#'   Mandatory columns for fallback: 'Min', 'Quart1', 'Median', 'Quart3', 'Max'.
+#'   For custom percentiles, any column name is allowed (e.g. 'P0', 'P5', 'P50', 'P95', 'P100').
+#'   Values of -1 indicate that percentile is unavailable.
+#' @param percentile_cols Character vector of columns to try using as custom percentiles
+#'   (e.g., c("P0","P5","P50","P95","P100")). Defaults to an empty vector, meaning "use fallback quartiles".
+#' @param n Integer, the number of samples to generate from the final KDE, defaults to 1000.
+#' @param sample_size Integer, the number of points to simulate around each quantile/percentile for initial
+#'   density estimation, defaults to 10000.
+#'
+#' @return A numeric vector containing sampled values from the estimated density.
+#'   The length of this vector will be equal to the parameter /code{n}.
+#'
+#' @examples
+#' # Example usage:
+#' # Suppose your dataframe has columns c("P0","P5","P50","P95","P100").
+#' # set.seed(123)  # for reproducibility
+#' # samples <- generate_density_based_distribution(df,
+#' #    percentile_cols = c("P0","P5","P50","P95","P100"),
+#' #    n = 1000, sample_size = 10000)
+#' # hist(samples, breaks = 30, main = "Simulated Distribution")
+#'
+#' @importFrom truncnorm rtruncnorm
+#' @export
+# generate_density_based_distribution <- function(quantile_df,
+#                                                 percentile_cols = character(0),
+#                                                 n = 1000,
+#                                                 sample_size = 10000) {
+#   
+#   # 1) Check for presence of custom percentile columns
+#   #    - Must exist in dataframe
+#   #    - Must not be -1
+#   #    - Must not be NA
+#   if (length(percentile_cols) > 0) {
+#     # Only keep those columns that are in the df
+#     present_cols <- percentile_cols[percentile_cols %in% names(quantile_df)]
+# 
+#     # Exclude columns where the first row is -1 or NA (you can adjust if needed)
+#     valid_cols <- present_cols[
+#       !is.na(quantile_df[1, present_cols]) &
+#         quantile_df[1, present_cols] != -1
+#     ]
+# 
+#     # If no valid custom percentiles remain, fallback to quartiles
+#     if (length(valid_cols) > 0) {
+#       use_cols <- valid_cols
+#     } else {
+#       stop(
+#       "Please provide valid percentile_cols."
+#       )
+#     }
+#   } else {
+#     # If no custom percentile_cols provided, use fallback
+#     stop(
+#       "Please provide valid percentile_cols."
+#     )
+#   }
+# 
+#   # 2) Extract the numeric values for the chosen columns
+#   #    (assuming row 1 holds the actual values for the distribution)
+#   chosen_vals <- unlist(quantile_df[1, use_cols], use.names = FALSE)
+#   chosen_vals <- na.omit(chosen_vals)
+# 
+#   # 3) Ensure at least 2 valid points
+#   if (length(chosen_vals) < 2) {
+#     stop("Insufficient valid data (less than 2) for density estimation.")
+#   }
+# 
+#   # 4) Prepare distribution for min / max
+#   #    We'll assume 'Min' and 'Max' exist among these columns or among fallback.
+#   #    If user-specified columns included P0, P100, that effectively serves as min/max.
+#   #    For robust code, let's find numeric min and max from chosen_vals:
+#   dist_min <- min(chosen_vals)
+#   dist_max <- max(chosen_vals)
+# 
+#   # 5) Simulate dense points around each chosen value
+#   dense_points <- numeric(0)
+#   for (i in seq_along(chosen_vals)) {
+#     # Estimate an SD for truncated normal around each chosen value
+#     if (i == 1) {
+#       # First point: use distance to next
+#       sd <- abs(chosen_vals[min(length(chosen_vals), i + 1)] - chosen_vals[i]) / 3
+#     } else if (i == length(chosen_vals)) {
+#       # Last point: use distance to previous
+#       sd <- abs(chosen_vals[i] - chosen_vals[i - 1]) / 3
+#     } else {
+#       # Middle points: use half of the smaller gap on either side
+#       sd_left  <- abs(chosen_vals[i] - chosen_vals[i - 1])
+#       sd_right <- abs(chosen_vals[i + 1] - chosen_vals[i])
+#       sd <- min(sd_left, sd_right) / 2
+#     }
+#     sd <- max(sd, 0.1)  # impose a minimum SD
+# 
+#     # Bounds for truncated normal
+#     lower <- if (i == 1) dist_min else -Inf
+#     upper <- if (i == length(chosen_vals)) dist_max else Inf
+# 
+#     # Simulate around the chosen value
+#     pts <- truncnorm::rtruncnorm(
+#       n = floor(sample_size / length(chosen_vals)),
+#       a = lower,
+#       b = upper,
+#       mean = chosen_vals[i],
+#       sd = sd
+#     )
+#     dense_points <- c(dense_points, pts)
+#   }
+# 
+#   # 6) KDE on the dense points
+#   d <- density(
+#     dense_points,
+#     adjust = 1,
+#     kernel = "gaussian",
+#     n = sample_size * 10
+#   )
+# 
+#   # Truncate KDE to [dist_min, dist_max]
+#   in_range <- d$x >= dist_min & d$x <= dist_max
+#   d$x <- d$x[in_range]
+#   d$y <- d$y[in_range]
+# 
+#   # Normalize so area under the curve is 1
+#   d$y <- d$y / sum(d$y)
+# 
+#   # 7) Sample from the KDE
+#   sampled_indices <- sample(seq_along(d$x), n, replace = TRUE, prob = d$y)
+#   samples <- d$x[sampled_indices]
+# 
+#   return(samples)
+# }
+
+
+generate_inverse_cdf_distribution <- function(quantile_df,
+                                              percentile_cols = c("P0","P5","P50","P95","P100"),
+                                              n = 1000) {
+  # 1) Verify percentile columns are present and valid
+  present_cols <- percentile_cols[percentile_cols %in% names(quantile_df)]
+  if (length(present_cols) == 0) {
+    stop("No valid percentile columns found in the data frame.")
+  }
+  
+  # Remove any columns with NA or -1 in the first row (adapt to your own rules)
+  valid_cols <- present_cols[
+    !is.na(quantile_df[1, present_cols]) & 
+      quantile_df[1, present_cols] != -1
+  ]
+  if (length(valid_cols) < 2) {
+    stop("Need at least 2 valid quantile columns to construct inverse CDF.")
+  }
+  
+  # 2) Extract the numeric values (the actual data) for each valid percentile col
+  x_vals <- unlist(quantile_df[1, valid_cols], use.names = FALSE)
+  
+  # 3) Convert column names like "P0","P5","P50","P95","P100" into probabilities 0, 0.05, 0.5, 0.95, 1.0
+  #    This step assumes that your column names always start with 'P' and the rest is the number.
+  #    If your naming is different, adapt accordingly.
+  get_prob <- function(colname) {
+    # remove 'P' and convert to numeric, e.g. "5" => 5. Then divide by 100 => 0.05
+    prob <- as.numeric(sub("P", "", colname)) / 100
+    return(prob)
+  }
+  cdf_vals <- sapply(valid_cols, get_prob)
+  
+  # 4) Sort them in ascending order, so we have a proper CDF
+  #    (In case the user gave them out of order)
+  sort_idx <- order(cdf_vals)
+  cdf_vals <- cdf_vals[sort_idx]
+  x_vals   <- x_vals[sort_idx]
+  
+  # 5) Build a piecewise-linear inverse CDF function using approxfun
+  #    We'll invert cdf_vals -> x_vals
+  inv_cdf <- approxfun(
+    x = cdf_vals,
+    y = x_vals,
+    method = "linear",
+    rule   = 2   # rule=2: out-of-range values are clamped to the boundary
+  )
+  
+  # 6) Sample from uniform(0,1) and map through the inverse CDF
+  u <- runif(n, min = 0, max = 1)
+  samples <- inv_cdf(u)
+  
+  return(samples)
+}
+
+
+fit_beta_from_percentiles <- function(quantile_df,
+                                      percentile_cols = c("P5", "P50", "P95"),
+                                      lower = 4,
+                                      upper = 8,
+                                      n = 1000) {
+  # Step 1: Extract and validate percentiles
+  # Check that percentile columns exist in the dataframe
+  present_cols <- percentile_cols[percentile_cols %in% names(quantile_df)]
+  if (length(present_cols) == 0) {
+    stop("No valid percentile columns found in the data frame.")
+  }
+  
+  # Remove any columns with NA or invalid values
+  valid_cols <- present_cols[
+    !is.na(quantile_df[1, present_cols]) & 
+      quantile_df[1, present_cols] != -1
+  ]
+  if (length(valid_cols) < 2) {
+    stop("Need at least 2 valid quantile columns to fit the Beta distribution.")
+  }
+  
+  # Extract numeric values from the valid percentile columns
+  x_vals <- unlist(quantile_df[1, valid_cols], use.names = FALSE)
+  
+  # Convert column names like "P5", "P50", "P95" into probabilities 0.05, 0.5, 0.95
+  get_prob <- function(colname) {
+    prob <- as.numeric(sub("P", "", colname)) / 100
+    return(prob)
+  }
+  cdf_vals <- sapply(valid_cols, get_prob)
+  
+  # Ensure proper CDF order
+  sort_idx <- order(cdf_vals)
+  cdf_vals <- cdf_vals[sort_idx]
+  x_vals   <- x_vals[sort_idx]
+  
+  # Scale x_vals to the [0, 1] range for Beta fitting
+  x_vals_scaled <- (x_vals - lower) / (upper - lower)
+  
+  # Step 2: Fit Beta distribution using the scaled values
+  if (length(x_vals_scaled) < 3) {
+    stop("At least 3 percentiles are required to robustly fit the Beta distribution.")
+  }
+  
+  library(fitdistrplus)
+  fit <- tryCatch(
+    {
+      fitdist(x_vals_scaled, "beta")
+    },
+    error = function(e) {
+      stop("Error fitting Beta distribution: ", e$message)
+    }
+  )
+  
+  # Step 3: Generate samples from the Beta distribution
+  samples <- rbeta(n, shape1 = fit$estimate[1], shape2 = fit$estimate[2])
+  
+  # Transform samples back to the original range [lower, upper]
+  samples <- samples * (upper - lower) + lower
+  
+  return(samples)
+}
+
+
+fit_normal_from_percentiles <- function(quantile_df,
+                                        percentile_cols = c("P5", "P50", "P95"),
+                                        n = 1000) {
+  # Step 1: Extract and validate percentiles
+  # Check that percentile columns exist in the dataframe
+  present_cols <- percentile_cols[percentile_cols %in% names(quantile_df)]
+  if (length(present_cols) == 0) {
+    stop("No valid percentile columns found in the data frame.")
+  }
+  
+  # Remove any columns with NA or invalid values
+  valid_cols <- present_cols[
+    !is.na(quantile_df[1, present_cols]) & 
+      quantile_df[1, present_cols] != -1
+  ]
+  if (length(valid_cols) < 2) {
+    stop("Need at least 2 valid quantile columns to fit the normal distribution.")
+  }
+  
+  # Extract numeric values from the valid percentile columns
+  x_vals <- unlist(quantile_df[1, valid_cols], use.names = FALSE)
+  
+  # Convert column names like "P5", "P50", "P95" into probabilities 0.05, 0.5, 0.95
+  get_prob <- function(colname) {
+    prob <- as.numeric(sub("P", "", colname)) / 100
+    return(prob)
+  }
+  cdf_vals <- sapply(valid_cols, get_prob)
+  
+  # Ensure proper CDF order
+  sort_idx <- order(cdf_vals)
+  cdf_vals <- cdf_vals[sort_idx]
+  x_vals   <- x_vals[sort_idx]
+  
+  # Step 2: Estimate mean and standard deviation
+  # Assume that P50 corresponds to the mean and use P5 and P95 to estimate standard deviation
+  if (length(x_vals) < 3) {
+    stop("At least 3 percentiles are required to robustly fit the normal distribution.")
+  }
+  
+  mean_val <- x_vals[which(cdf_vals == 0.5)]
+  if (length(mean_val) == 0) {
+    stop("Missing median (P50) value for normal distribution fitting.")
+  }
+  std_val <- (x_vals[which(cdf_vals == 0.95)] - x_vals[which(cdf_vals == 0.05)]) / 3.29  # Approx 3.29 SD for 90% interval
+  
+  # Step 3: Generate samples from the normal distribution
+  samples <- rnorm(n, mean = mean_val, sd = std_val)
+  
+  return(samples)
+}
+
+#' Calculate Summary Statistics for Numeric Data
+#'
+#' This function computes a comprehensive set of summary statistics for a given numeric vector.
+#' It checks that the input is numeric and calculates various measures including basic statistics,
+#' user-specified percentiles, quartiles, and distribution characteristics.
+#'
+#' @param data A numeric vector for which summary statistics are to be calculated.
+#' @param percentile_probs A numeric vector of probabilities (between 0 and 1) for which percentiles
+#'   should be calculated. Defaults to `c(0.1, 0.2, ..., 0.9)`.
+#'
+#' @return A data frame containing the following summary statistics:
+#'   - Number of observations (Num)
+#'   - Mean (Mean)
+#'   - Standard deviation (STD)
+#'   - Coefficient of variation (CV)
+#'   - Median (Median)
+#'   - Median absolute deviation (MAD)
+#'   - Minimum value (Min)
+#'   - Maximum value (Max)
+#'   - Variance (Var)
+#'   - Standard error of the mean (SE)
+#'   - Percentiles (PXX for each specified probability in `percentile_probs`)
+#'   - First and third quartiles (Quart1, Quart3)
+#'
+#' @examples
+#' test_data <- rnorm(100, mean = 50, sd = 10)
+#' summary_stats <- calculate_summary_statistics(test_data, percentile_probs = c(0.05, 0.5, 0.95))
+#' print(summary_stats)
+#'
+#' @export
+calculate_summary_statistics <- function(data, percentile_probs = seq(0.1, 0.9, by = 0.1)) {
+    # Ensure the input is a numeric vector
+    if (!is.numeric(data)) {
+        stop("Data must be a numeric vector.")
+    }
+    if (!is.numeric(percentile_probs) || any(percentile_probs < 0 | percentile_probs > 1)) {
+        stop("Percentile probabilities must be numeric values between 0 and 1.")
+    }
+
+    # Calculating basic statistics
+    num <- length(data)
+    mean_value <- mean(data)
+    std_dev <- sd(data)
+    cv <- (std_dev / mean_value) * 100
+    median_value <- median(data)
+    mad_value <- mad(data)
+    min_value <- min(data)
+    max_value <- max(data)
+    variance_value <- var(data)
+    se <- std_dev / sqrt(num)
+
+    # Calculating percentiles
+    percentiles <- quantile(data, probs = percentile_probs, na.rm = TRUE)
+
+    # Calculating quartiles
+    quartiles <- quantile(data, probs = c(0.25, 0.75), na.rm = TRUE)
+    quart1 <- quartiles[1]
+    quart3 <- quartiles[2]
+
+    # Creating a named vector of percentiles (e.g., P05, P50, P95)
+    percentile_names <- paste0("P", sprintf("%02d", as.integer(percentile_probs * 100)))
+    percentile_values <- as.list(percentiles)
+    names(percentile_values) <- percentile_names
+
+    # Combining results into a single data frame
+    summary_df <- data.frame(
+        Num = num,
+        Mean = mean_value,
+        STD = std_dev,
+        CV = cv,
+        Median = median_value,
+        MAD = mad_value,
+        Min = min_value,
+        Max = max_value,
+        Var = variance_value,
+        Quart1 = quart1,
+        Quart3 = quart3,
+        SE = se
+    )
+
+    # Append percentile columns dynamically
+    summary_df <- cbind(summary_df, as.data.frame(t(percentile_values)))
+
+    return(summary_df)
+}
+
+```
+
+
+```{r}
+# Set the path to your geodatabase
+gdb_path <- "C:/R_Drive/Data_Files/LPKS_Data/Data/Soil_Pedon_Databases/WISE_V3/WISE3_Geodatabase.gdb"
+
+# List all layers in the geodatabase
+layers <- st_layers(gdb_path)
+print(layers)
+
+# Read a specific layer from the geodatabase
+WISE3_SITE <- st_read(gdb_path, layer = "WISE3_SITE")
+View(WISE3_SITE)
+
+WISE3_SITE_filtered <- subset(WISE3_SITE, !is.na(LONDD) & !is.na(LATDD))
+
+WISE3_SITE_sf <- st_as_sf(WISE3_SITE_filtered, coords = c("LONDD", "LATDD"), crs = 4326)
+
+# Create an interactive leaflet map.
+leaflet(WISE3_SITE_filtered) %>%
+  addTiles() %>%  # Base map tiles (OpenStreetMap)
+  # Add point markers as an overlay group named "Points"
+  addCircleMarkers(
+    lng = ~LONDD,
+    lat = ~LATDD,
+    group = "Points",
+    radius = 5,
+    color = "blue",
+    fillOpacity = 0.7,
+    popup = ~paste("Site:", WISE3_id)
+  ) %>%
+  # Add a layers control that allows toggling the "Points" overlay on and off.
+  addLayersControl(
+    overlayGroups = c("Points"),
+    options = layersControlOptions(collapsed = FALSE)
+  )
+
+
+# Load WoSIS pedon data
+observations <- readr::read_tsv(
+  'C:/R_Drive/Data_Files/LPKS_Data/Data/Soil_Pedon_Databases/WoSIS/WoSIS_2023_December/WoSIS_2023_December/wosis_202312_observations.tsv',
+  col_types = 'cccciid'
+)
+print(observations)
+
+sites <- readr::read_tsv(
+  'C:/R_Drive/Data_Files/LPKS_Data/Data/Soil_Pedon_Databases/WoSIS/WoSIS_2023_December/WoSIS_2023_December/wosis_202312_sites.tsv',
+  col_types = 'iddcccc'
+)
+str(sites)
+
+# Create an interactive leaflet map.
+leaflet(sites) %>%
+  addTiles() %>%  # Base map tiles (OpenStreetMap)
+  # Add point markers as an overlay group named "Points"
+  addCircleMarkers(
+    lng = ~longitude,
+    lat = ~latitude,
+    group = "Points",
+    radius = 5,
+    color = "blue",
+    fillOpacity = 0.7,
+    popup = ~paste("Site:", site_id)
+  ) %>%
+  # Add a layers control that allows toggling the "Points" overlay on and off.
+  addLayersControl(
+    overlayGroups = c("Points"),
+    options = layersControlOptions(collapsed = FALSE)
+  )
+
+profiles <- readr::read_tsv(
+  'C:/R_Drive/Data_Files/LPKS_Data/Data/Soil_Pedon_Databases/WoSIS/WoSIS_2023_December/WoSIS_2023_December/wosis_202312_profiles.tsv',
+  col_types = 'icciccddcccccciccccicccci'
+)
+print(profiles)
+
+layers <- readr::read_tsv(
+  'C:/R_Drive/Data_Files/LPKS_Data/Data/Soil_Pedon_Databases/WoSIS/WoSIS_2023_December/WoSIS_2023_December/wosis_202312_layers.tsv',
+  col_types = 'iiciciiilcc'
+)
+print(layers)
+
+wosis_clay <- read.table('C:/R_Drive/Data_Files/LPKS_Data/Data/Soil_Pedon_Databases/WoSIS/WoSIS_2023_December/WoSIS_2023_December/wosis_202312_clay.tsv',
+ sep = "/t",
+ header = TRUE,
+ quote = "",
+ comment.char = "",
+ stringsAsFactors = FALSE
+)
+```
+
+#Process wISE30sec Stat info
+```{r}
+#`````````````````````````````````````````````````````````````
+# Prep WISE30sec statistical data
+stat_PLVR1 <- read.csv('C:/R_Drive/Data_Files/LPKS_Data/Data/Global_Soil_Maps/wise_30sec_v1/Interchangeable_format/stat_PLVR1.txt')
+stat_KSPH1 <- read.csv('C:/R_Drive/Data_Files/LPKS_Data/Data/Global_Soil_Maps/wise_30sec_v1/Interchangeable_format/stat_KSPH1.txt')
+stat_CMHS1 <- read.csv('C:/R_Drive/Data_Files/LPKS_Data/Data/Global_Soil_Maps/wise_30sec_v1/Interchangeable_format/stat_CMHS1.txt')
+stat_ACCL1 <- read.csv('C:/R_Drive/Data_Files/LPKS_Data/Data/Global_Soil_Maps/wise_30sec_v1/Interchangeable_format/stat_ACCL1.txt')
+
+# Merge the two data frames by Cluster_ID
+HW30s_p <- rbind(stat_PLVR1, stat_KSPH1, stat_CMHS1, stat_ACCL1)
+# Assuming df is your dataframe and Cluster_ID is the column to parse
+HW30s_p <- HW30s_p %>%
+  mutate(
+    FAO = str_sub(Cluster_ID, 1, 3),  # Extracts the first three characters regardless of case
+    Property = str_extract(Cluster_ID, "(?<=^[A-Za-z]{3})[A-Z]+"),  # Extracts capital letters following the first three characters
+    Climate = str_extract(Cluster_ID, "(?<=/)[A-Z]+(?=/)"),  # Extracts letters between the first and second slashes
+    Depth = str_split(Cluster_ID, "/", simplify = TRUE)[,3]  # Extracts everything after the second slash
+  )
+HW30s_p <- HW30s_p %>%
+  mutate(RowIndex = row_number())
+HW30s_p$PRID <- paste(HW30s_p$FAO, HW30s_p$Climate, sep = "/")
+HW30s_p$Depth <- gsub("u$", "", HW30s_p$Depth)
+
+write.csv(HW30s_p, 'C:/R_Drive/Data_Files/LPKS_Data/Data/Global_Soil_Maps/wise_30sec_v1/HW30s_dist.csv')
+```
+
+#Queried data from SoilID
+```{r}
+# Querried from soilid codebase
+# HWSD 1.2 data for point = (lat:7.3318, lon:-1.4631)
+HWSD_soilid <- data.frame(
+  mukey = c(1270, 1444, 1270, 1444, 1444, 1444),
+  compname = c("Ferric Lixisols", "Ferric Lixisols", "Lithic Leptosols",
+               "Lithic Leptosols", "Plinthic Lixisols", "Gleyic Luvisols"),
+  distance = c(0.0000, 2696.1574, 0.0000, 2696.1574, 2696.1574, 2696.1574),
+  share = c(50, 50, 50, 10, 30, 10),
+  cokey = c(106313, 107870, 106314, 107873, 107871, 107872),
+  fss = c("FAO90", "FAO90", "FAO90", "FAO90", "FAO90", "FAO90"),
+  distance_score = c(0.364964, 0.364964, 0.364964, 0.364964, 0.081022, 0.027007),
+  Index = c(0, 2, 1, 5, 3, 4),
+  min_dist = c(0.0000, 0.0000, 0.0000, 0.0000, 2696.1574, 2696.1574)
+)
+FAO_tax <- read.csv('C:/LandPKS_API_SoilID-master/global/LPKS_WRB_FAO90_Tax.csv')
+HWSD_soilid <- HWSD_soilid %>% left_join(FAO_tax %>% select(WRB_tax, CLAF), by=c('compname'='WRB_tax'))
+
+```
+
+HWSD Data
+```{r}
+# HWSD 2.0
+hwsd_gdb_path <- "C:/R_Drive/Data_Files/LPKS_Data/Data/Global_Soil_Maps/HWSD_v2.0/HWSD2.gdb"
+hwsd_layers <- st_layers(hwsd_gdb_path)
+print(hwsd_layers)
+
+#Load necessary files
+# Load a specific layer from the HWSD geodatabase
+HWSD2_SMU <- st_read(hwsd_gdb_path, layer = "HWSD2_SMU")
+HWSD2_layers <- st_read(hwsd_gdb_path, layer = "HWSD2_LAYERS")
+
+#Load Processed WISE30sec stat data
+HW30s_p <- read.csv('C:/R_Drive/Data_Files/LPKS_Data/Data/Global_Soil_Maps/wise_30sec_v1/HW30s_dist.csv')
+#Load WISE30sec full data
+HW30s_full <- read.csv('C:/R_Drive/Data_Files/LPKS_Data/Data/Global_Soil_Maps/wise_30sec_v1/Interchangeable_format/HW30s_FULL.txt')
+
+# list mukeys from soilid api (previously defined above)
+mukeys <- soil_data$mukey
+
+prepare_final_dataframe <- function(HWSD2_SMU, HWSD2_layers, HW30s_full, HW30s_p, HWSD_soilid, mukeys) {
+  library(dplyr)
+
+  # Step 1: Subset HWSD2_SMU based on mukeys
+  HWSD2_SMU_sub <- HWSD2_SMU[which(HWSD2_SMU$HWSD1_SMU_ID %in% mukeys), ]
+
+  # Step 2: Subset HWSD2_layers based on HWSD2_SMU_ID
+  HWSD2_layers_sub <- HWSD2_layers[which(HWSD2_layers$HWSD2_SMU_ID %in% HWSD2_SMU_sub$HWSD2_SMU_ID), ]
+
+  # Step 3: Subset HW30s_full based on WISE30s_SMU_ID and remove duplicates
+  HW30s_full_sub <- HW30s_full[HW30s_full$NEWSUID %in% HWSD2_layers_sub$WISE30s_SMU_ID, ]
+  HW30s_full_sub <- unique(HW30s_full_sub[, c('NEWSUID', 'SCID', 'PROP', 'CLAF', 'PRID')])
+  rownames(HW30s_full_sub) <- NULL
+
+  # Step 4: Subset HW30s_p based on unique PRID from HW30s_full_sub
+  HW30s_p_sub <- HW30s_p[HW30s_p$PRID %in% unique(HW30s_full_sub$PRID), ]
+
+  # Step 5: Perform a full join of HW30s_full_sub and HW30s_p_sub
+  HW30s_full_stats <- HW30s_full_sub %>%
+    full_join(HW30s_p_sub, by = c("PRID" = "PRID", "Layer" = "Depth"))
+
+  # Step 6: Add a new column 'mukey' by extracting the last 4 digits of NEWSUID
+  HW30s_full_stats <- HW30s_full_stats %>%
+    mutate(mukey = substr(NEWSUID, nchar(NEWSUID) - 3, nchar(NEWSUID)) %>% as.numeric())
+
+  # Step 7: Perform a left join with HWSD_soilid
+  HW30s_full_stats <- HW30s_full_stats %>%
+    left_join(
+      HWSD_soilid %>% select(mukey, compname, share, distance_score, CLAF),
+      by = c('mukey' = 'mukey', 'PROP' = 'share', 'CLAF' = 'CLAF')
+    )
+
+  # Step 8: Select the required columns
+  columns_to_select <- c(
+    "NEWSUID", "SCID", "PROP", "CLAF", "PRID", "Drain", "DrainNum", "Layer",
+    "TopDep", "BotDep", "Num0", "Num", "Mean", "STD", "CV", "Median", "MAD",
+    "Min", "Max", "Var", "FAO_90", "P10", "P20", "P30", "P40", "P50", "P60",
+    "P70", "P80", "P90", "Quart1", "Quart3", "Cluster_ID", "SE", "FAO",
+    "Property", "Climate", "RowIndex", 'compname', 'distance_score'
+  )
+
+  HW30s_full_stats <- HW30s_full_stats %>%
+    select(all_of(columns_to_select))
+
+  return(HW30s_full_stats)
+}
+
+# Run function each time there is a new set of mukeys
+HW30s_full_stats <- prepare_final_dataframe(HWSD2_SMU, HWSD2_layers, HW30s_full, HW30s_p, HWSD_soilid, mukeys)
+
+# Then run code to prep data for set 'Property' and 'TopDep'
+HW30s_full_stats_ghana_clay <- HW30s_full_stats %>%
+  select(all_of(columns_to_select)) %>%
+  filter(!is.na(Cluster_ID)) %>%
+  filter(Property %in% c("CLAY")) %>%
+  filter(TopDep == 0) %>%
+  rename(
+    P0 = Min,
+    P100 = Max,
+    P25 = Quart1,
+    P75 = Quart3
+  ) %>%
+  group_by(compname) %>%
+  slice(1) %>%  # Take the first row from each group
+  ungroup() %>% as.data.frame()
+
+HW30s_full_stats_ghana_ph <- HW30s_full_stats %>%
+  select(all_of(columns_to_select)) %>%
+  filter(!is.na(Cluster_ID)) %>%
+  filter(Property %in% c("PHH")) %>%
+  filter(TopDep == 0) %>%
+  rename(
+    P0 = Min,
+    P100 = Max,
+    P25 = Quart1,
+    P75 = Quart3
+  ) %>%
+  group_by(compname) %>%
+  slice(1) %>%  # Take the first row from each group
+  ungroup() %>% as.data.frame()
+
+HW30s_full_stats_ghana_cec <- HW30s_full_stats %>%
+  select(all_of(columns_to_select)) %>%
+  filter(!is.na(Cluster_ID)) %>%
+  filter(Property %in% c("CEC")) %>%
+  filter(TopDep == 0) %>%
+  rename(
+    P0 = Min,
+    P100 = Max,
+    P25 = Quart1,
+    P75 = Quart3
+  ) %>%
+  group_by(compname) %>%
+  slice(1) %>%  # Take the first row from each group
+  ungroup() %>% as.data.frame()
+
+
+```
+
+```{r}
+library(dplyr)
+library(purrr)
+library(truncnorm)
+
+apply_distribution_function <- function(database, percentile_cols) {
+  # Check that percentile columns exist in the database
+  if (!all(percentile_cols %in% colnames(database))) {
+    stop("Some percentile columns are missing from the database.")
+  }
+  
+  # Ensure the distance_score column exists
+  if (!"distance_score" %in% colnames(database)) {
+    stop("The distance_score column is missing from the database.")
+  }
+
+  # Apply the function row-wise
+  simulated_distributions <- database %>%
+    rowwise() %>%
+    mutate(
+      simulated_distribution = list(
+        tryCatch(
+          generate_inverse_cdf_distribution(
+            quantile_df = pick(everything()),  # Replacing `cur_data()` with `pick(everything())`
+            percentile_cols = percentile_cols,
+            n = max(1, floor(distance_score * 10000))  # Use distance_score to calculate `n`, ensure `n >= 1`
+          ),
+          error = function(e) {
+            message(sprintf("Error in row %d: %s", cur_group_id(), e$message))
+            return(NA)
+          }
+        )
+      )
+    ) %>%
+    ungroup()
+
+  # Extract the simulated distributions into a list
+  simulated_list <- simulated_distributions %>%
+    pull(simulated_distribution) %>%
+    split(seq_along(.))  # Assign each row's simulation to a separate list item
+
+  return(simulated_list)
+}
+
+
+
+# Specify the percentile columns
+percentile_cols <- c("P0", "P10", "P20","P25", "P30", "P40", "P50", "P60", "P70", "P75", "P80", "P90", "P100")
+
+# Apply the function
+simulated_distributions_d1_clay <- apply_distribution_function(
+  database = HW30s_full_stats_ghana_clay,
+  percentile_cols = percentile_cols
+)
+
+# Apply the function
+simulated_distributions_d1_ph <- apply_distribution_function(
+  database = HW30s_full_stats_ghana_ph,
+  percentile_cols = percentile_cols
+)
+
+# Apply the function
+simulated_distributions_d1_cec <- apply_distribution_function(
+  database = HW30s_full_stats_ghana_cec,
+  percentile_cols = percentile_cols
+)
+
+#Get the lengths of each simulated distribution
+lengths_clay <- map_int(simulated_distributions_d1_clay, ~ length(.x[[1]]))
+lengths_ph <- map_int(simulated_distributions_d1_ph, ~ length(.x[[1]]))
+lengths_cec <- map_int(simulated_distributions_d1_cec, ~ length(.x[[1]]))
+
+# Create the soil_data data frame by combining values from each simulated distribution
+hwsd_d1_clay <- data.frame(
+  value = unlist(simulated_distributions_d1_clay),  # Flatten the list into a single vector
+  `Soil Type` = rep(
+    HW30s_full_stats_ghana_clay$compname[1:length(simulated_distributions_d1_clay)],  # Match the number of compnames to the distributions
+    times = sapply(simulated_distributions_d1_clay, function(x) length(x[[1]]))  # Repeat compnames based on the lengths of distributions
+  )
+)
+
+hwsd_d1_ph <- data.frame(
+  value = unlist(simulated_distributions_d1_ph),  # Flatten the list into a single vector
+  `Soil Type` = rep(
+    HW30s_full_stats_ghana_ph$compname[1:length(simulated_distributions_d1_ph)],  # Match the number of compnames to the distributions
+    times = sapply(simulated_distributions_d1_ph, function(x) length(x[[1]]))  # Repeat compnames based on the lengths of distributions
+  )
+)
+
+hwsd_d1_cec <- data.frame(
+  value = unlist(simulated_distributions_d1_cec),  # Flatten the list into a single vector
+  `Soil Type` = rep(
+    HW30s_full_stats_ghana_cec$compname[1:length(simulated_distributions_d1_cec)],  # Match the number of compnames to the distributions
+    times = sapply(simulated_distributions_d1_cec, function(x) length(x[[1]]))  # Repeat compnames based on the lengths of distributions
+  )
+)
+
+# Extract means and properties
+means_clay <- HW30s_full_stats_ghana_clay$Mean[1:3]
+properties_clay <- HW30s_full_stats_ghana_clay$compname[1:3]
+
+means_ph <- HW30s_full_stats_ghana_ph$Mean[1:3]
+properties_ph <- HW30s_full_stats_ghana_ph$compname[1:3]
+
+means_cec <- HW30s_full_stats_ghana_cec$Mean[1:3]
+properties_cec <- HW30s_full_stats_ghana_cec$compname[1:3]
+
+
+# Create a data frame for vertical lines
+vline_data_clay <- data.frame(
+  xintercept = means_clay,
+  Soil.Type = properties_clay  # Map the properties to the means
+)
+
+vline_data_ph <- data.frame(
+  xintercept = means_ph,
+  Soil.Type = properties_ph  # Map the properties to the means
+)
+
+vline_data_cec <- data.frame(
+  xintercept = means_cec,
+  Soil.Type = properties_cec  # Map the properties to the means
+)
+
+
+plot_stacked_distributions <- function(data, vline_data, x_limits = c(4, 8), title = "Surface pH Distributions", x_label = "pH") {
+    
+    # Create the plot
+    ggplot(data, aes(x = value, fill = Soil.Type, color = Soil.Type)) +
+        geom_density(alpha = 0.4, lwd = 1) +
+        geom_vline(
+            data = vline_data,
+            aes(xintercept = xintercept, color = Soil.Type),
+            linetype = "dashed", lwd = 1
+        ) +
+        labs(
+            title = title,
+            x = x_label,
+            y = "Density"
+        ) +
+        scale_fill_brewer(palette = "Set1") +
+        scale_color_brewer(palette = "Set1") +
+        scale_x_continuous(limits = x_limits) +  # Adjust x-axis limits
+        theme_minimal() +
+        facet_wrap(~ Soil.Type, ncol = 1, scales = "free_y") +  # Stack distributions vertically
+        theme(
+            legend.position = "top",  # Place legend at the top
+            strip.text = element_text(size = 12, face = "bold")  # Customize facet labels
+        )
+}
+
+plot_overlapping_distributions <- function(data, vline_data, x_limits = c(4, 8), title = "Surface pH Distributions", x_label = "pH") {
+    
+    # Create the plot
+    ggplot(data, aes(x = value, fill = Soil.Type, color = Soil.Type)) +
+        geom_density(alpha = 0.4, lwd = 1, position = "identity") +
+        geom_vline(
+            data = vline_data,
+            aes(xintercept = xintercept, color = Soil.Type),
+            linetype = "dashed", lwd = 1
+        ) +
+        labs(
+            title = title,
+            x = x_label,
+            y = "Density"
+        ) +
+        scale_fill_brewer(palette = "Set1") +
+        scale_color_brewer(palette = "Set1") +
+        scale_x_continuous(limits = x_limits) +  # Adjust x-axis limits
+        theme_minimal() +
+        theme(
+            legend.position = "top",  # Place legend at the top for clarity
+            plot.title = element_text(size = 14, face = "bold"),
+            axis.title = element_text(size = 12)
+        )
+}
+plot_stacked_distributions(hwsd_d1_ph, vline_data_ph, title = "HWSD Surface pH Distributions")
+# Example usage:
+plot_overlapping_distributions(
+    data = hwsd_d1_ph,
+    vline_data = vline_data_ph,
+    x_limits = c(4, 8),
+    title = "Combined Surface pH Distributions",
+    x_label = "pH"
+)
+
+# Plot with vertical lines
+ggplot(soil_data, aes(x = value, fill = Soil.Type, color = Soil.Type)) +
+  geom_density(alpha = 0.4, lwd = 1, position = "identity") +
+  geom_vline(
+    data = vline_data,
+    aes(xintercept = xintercept, color = Soil.Type),
+    linetype = "dashed", lwd = 1
+  ) +
+  labs(
+    title = "Surface Clay Distributions",
+    x = "% Clay",
+    y = "Density"
+  ) +
+  scale_fill_brewer(palette = "Set1") +
+  scale_color_brewer(palette = "Set1") +
+  scale_x_continuous(limits = c(0, 100)) +  # Adjust x-axis limits
+  theme_minimal() +
+  theme(legend.position = "top")  # Place legend at the top for clarity
+
+# Create a data frame for plotting
+combined_data_clay <- data.frame(value = unlist(simulated_distributions_d1_clay))
+combined_data_ph <- data.frame(value = unlist(simulated_distributions_d1_ph))
+combined_data_cec <- data.frame(value = unlist(simulated_distributions_d1_cec))
+
+FL_ph <- hwsd_d1_ph %>% filter(Soil.Type== "Ferric Lixisols") %>% dplyr::select(value) %>% as.vector()
+
+# Assuming `mean_value` is the mean value you want to use for the vertical line
+mean_value_clay <- mean(combined_data_clay$value, na.rm = TRUE)
+mean_value_ph <- mean(combined_data_ph$value, na.rm = TRUE)
+mean_value_cec <- mean(combined_data_cec$value, na.rm = TRUE)
+
+# Plot with a vertical line
+ggplot(combined_data, aes(x = value)) +
+  geom_density(fill = "blue", alpha = 0.4, color = "darkblue", lwd = 1) +
+  geom_vline(
+    xintercept = mean_value,  # Use xintercept for the vertical line
+    linetype = "dashed", 
+    color = "red",  # Set the line color
+    lwd = 1
+  ) +
+  labs(
+    title = "Combined Proportional Surface Clay Distribution",
+    x = "% Clay",
+    y = "Density"
+  ) +
+  scale_x_continuous(limits = c(0, 100)) +  # Adjust x-axis limits
+  theme_minimal()
+
+```
+
+
+
+```{r}
+ghana_test_profile <- profiles %>% filter(profile_id == 1491643)
+ghana_test_layers <- layers %>% filter(profile_id == 1491643) 
+ghana_wosis_clay <- wosis_clay %>% filter(profile_id == 1491643)
+surf_clay_measured <- ghana_wosis_clay$value_avg[1]
+
+#1491643
+#04N0697
+```
+
+SoilGrids Data
+```{r}
+5.93588	-1.3338
+  lon = -1.4631, # Longitude
+  lat = 7.3318   # Latitude
+# Fetch SoilGrids data for specific points
+ghana.point <- data.frame(
+  id = c("A"),
+  lat = c(7.3318), # 7.2267
+  lon = c(-1.4631), # -1.2152
+  stringsAsFactors = FALSE
+)
+x <- try(fetchSoilGrids(ghana.point))
+
+#print(x@horizons)
+
+profile_long_bounded <- process_soil_profile_data(x, scaling_factor = .1)
+
+sg_dist_clay <- fit_beta_from_percentiles(
+  quantile_df = profile_long_bounded[4, ],
+  percentile_cols = c("P5", "P50", "P95"),
+  lower = profile_long_bounded[4, ]$P0,
+  upper = profile_long_bounded[4, ]$P100,
+  n = 10000
+)
+
+
+sg_dist_clay <- fit_normal_from_percentiles(
+  quantile_df = profile_long_bounded[4, ],
+  percentile_cols = c("P05", "P50", "P95"),
+  n = 10000
+)
+
+# Generate 10,000 samples from the inverse CDF
+sg_dist_clay <- generate_inverse_cdf_distribution(
+  quantile_df    = profile_long_bounded[4, ],
+  percentile_cols = c("P0", "P5", "P50", "P95", "P100"),
+  n = 10000
+)
+sg_dist_clay_df <-  data.frame(value = sg_dist_clay)
+
+set.seed(123)
+sg_dist_ph <- generate_inverse_cdf_distribution(
+  quantile_df    = profile_long_bounded[6, ],
+  percentile_cols = c("P0", "P05", "P50", "P95", "P100"),
+  n = 10000
+)
+sg_dist_ph_df <-  data.frame(value = sg_dist_ph)
+sg_pH_mean_value <- mean(sg_dist_ph)
+
+sg_dist_ph <- fit_beta_from_percentiles(
+  quantile_df = profile_long_bounded[6, ],
+  percentile_cols = c("P05", "P50", "P95"),
+  lower = profile_long_bounded[4, ]$P0[[1]],
+  upper = profile_long_bounded[4, ]$P100[[1]],
+  n = 10000
+)
+
+sg_dist_ph <- fit_normal_from_percentiles(
+  quantile_df = profile_long_bounded[6, ],
+  percentile_cols = c("P05", "P50", "P95"),
+  n = 10000
+)
+
+sg_dist_ph_df <-  data.frame(value = sg_dist_ph)
+sg_pH_mean_value <- mean(sg_dist_ph)
+
+# add percentiles to illustrate how more detailed distribution data can influence results
+sq_ph_syn_data <- profile_long_bounded[6, ]
+sq_ph_syn_data$P10 <- 4.9
+sq_ph_syn_data$P20 <- 5.0
+sq_ph_syn_data$P30 <- 5.1
+sq_ph_syn_data$P40 <- 5.3
+sq_ph_syn_data$P60 <- 5.9
+sq_ph_syn_data$P70 <- 6.1
+sq_ph_syn_data$P80 <- 6.4
+sg_dist_ph_syn <- generate_inverse_cdf_distribution(
+  quantile_df    = sq_ph_syn_data,
+  percentile_cols = c("P0", "P05", "P20", "P30", "P40", "P50", "P60", "P70", "P80", "P95", "P100"),
+  n = 10000
+)
+sg_dist_ph_df_syn <-  data.frame(value = sg_dist_ph_syn)
+
+sg_dist_cec <- generate_inverse_cdf_distribution(
+  quantile_df    = profile_long_bounded[2, ],
+  percentile_cols = c("P0", "P5", "P50", "P95", "P100"),
+  n = 10000
+)
+sg_dist_cec_df <-  data.frame(value = sg_dist_cec)
+
+sg_dist_soc <- generate_inverse_cdf_distribution(
+  quantile_df    = profile_long_bounded[9, ],
+  percentile_cols = c("P0", "P5", "P50", "P95", "P100"),
+  n = 10000
+)
+sg_dist_soc_df <-  data.frame(value = sg_dist_soc)
+
+
+calculate_summary_statistics(sg_dist_clay, percentile_probs = c(0.05, 0.5, 0.95))
+calculate_summary_statistics(sg_dist_ph, percentile_probs = c(0.05, 0.5, 0.95))
+calculate_summary_statistics(sg_dist_cec, percentile_probs = c(0.05, 0.5, 0.95))
+
+# Plot with a vertical line
+ggplot(sg_dist_ph_df, aes(x = value)) +
+  geom_density(fill = "blue", alpha = 0.4, color = "darkblue", lwd = 1) +
+  geom_vline(
+    xintercept = sg_pH_mean_value,  # Use xintercept for the vertical line
+    linetype = "dashed", 
+    color = "red",  # Set the line color
+    lwd = 1
+  ) +
+  labs(
+    title = "SoilGrids Surface pH Distribution",
+    x = "pH",
+    y = "Density"
+  ) +
+  scale_x_continuous(limits = c(4, 8)) +  # Adjust x-axis limits
+  theme_minimal()
+
+
+plot_density_with_vline <- function(data, vline_value, 
+                                    x_limits = c(4, 8), 
+                                    plot_title = "Density Plot",
+                                    x_axis_label = "Value") {
+  # Create the plot
+  ggplot(data, aes(x = value)) +  # Explicitly use the "value" column
+    geom_density(fill = "blue", alpha = 0.4, color = "darkblue", lwd = 1) +
+    geom_vline(
+      xintercept = vline_value,
+      linetype = "dashed", 
+      color = "red",
+      lwd = 1
+    ) +
+    labs(
+      title = plot_title,
+      x = x_axis_label,
+      y = "Density"
+    ) +
+    scale_x_continuous(limits = x_limits) +
+    theme_minimal()
+}
+
+plot_density_with_vline(
+  data = sg_dist_ph_df,
+  vline_value = sg_pH_mean_value,
+  x_limits = c(3.5, 8.5),
+  plot_title = "SoilGrids Surface pH Distribution",
+  x_axis_label = "pH"
+)
+
+# 1. Generate the empirical CDF
+empirical_cdf <- ecdf(samples)
+
+# Evaluate the CDF at specific points
+x_values <- seq(min(samples), max(samples), length.out = 100)
+cdf_values <- empirical_cdf(x_values)
+
+# 2. Generate the empirical PDF
+pdf_estimation <- density(samples)
+
+# 3. Plot the CDF
+plot(x_values, cdf_values, type = "l", col = "blue", lwd = 2,
+     main = "Empirical CDF and PDF", xlab = "Values", ylab = "Probability / Density")
+grid()
+
+# Add the PDF to the same plot
+lines(pdf_estimation, col = "red", lwd = 2)
+
+# Add a legend
+legend("topright", legend = c("CDF", "PDF"),
+       col = c("blue", "red"), lty = 1, lwd = 2)
+```
+
+
+```{r}
+# Define the Bayesian updating function
+bayesian_update <- function(prior_distribution, likelihood_distribution, grid_range = NULL, grid_resolution = 0.01) {
+  # Determine the range of the grid dynamically if not provided
+  if (is.null(grid_range)) {
+    grid_min <- min(c(prior_distribution, likelihood_distribution)) - 1
+    grid_max <- max(c(prior_distribution, likelihood_distribution)) + 1
+  } else {
+    grid_min <- grid_range[1]
+    grid_max <- grid_range[2]
+  }
+  
+  # Define the value grid
+  value_grid <- seq(grid_min, grid_max, by = grid_resolution)
+  
+  # Estimate densities for the prior and likelihood
+  prior_density <- density(prior_distribution, bw = "nrd0", from = grid_min, to = grid_max, n = length(value_grid))
+  likelihood_density <- density(likelihood_distribution, bw = "nrd0", from = grid_min, to = grid_max, n = length(value_grid))
+  
+  # Interpolate densities to match the grid
+  prior_prob <- approxfun(prior_density$x, prior_density$y)(value_grid)
+  likelihood_prob <- approxfun(likelihood_density$x, likelihood_density$y)(value_grid)
+  
+  # Normalize densities to ensure they sum to 1 (if not already normalized)
+  prior_prob <- prior_prob / sum(prior_prob)
+  likelihood_prob <- likelihood_prob / sum(likelihood_prob)
+  
+  # Compute the posterior using Bayes' rule: posterior ∝ prior * likelihood
+  posterior_prob <- prior_prob * likelihood_prob
+  posterior_prob <- posterior_prob / sum(posterior_prob)  # Normalize posterior
+  
+  # Sample from the posterior
+  posterior_samples <- sample(value_grid, size = 1000, prob = posterior_prob, replace = TRUE)
+  
+  # Return the posterior samples as the constrained distribution
+  return(posterior_samples)
+}
+
+```
+
+```{r}
+
+
+# Simulate prior and likelihood distributions
+empirical_prior_clay <- unlist(combined_data_clay)
+model_predictions_clay <- sg_dist_clay
+
+# Perform Bayesian updating
+posterior_samples_clay <- bayesian_update(
+  prior_distribution = empirical_prior_clay, 
+  likelihood_distribution = model_predictions_clay
+)
+
+# Simulate prior and likelihood distributions
+empirical_prior_ph <- unlist(combined_data_ph)
+model_predictions_ph <- sg_dist_ph
+#model_predictions_ph <- sg_dist_ph_syn
+# Perform Bayesian updating
+posterior_samples_ph <- bayesian_update(
+  prior_distribution = empirical_prior_ph, 
+  likelihood_distribution = model_predictions_ph
+)
+
+# Simulate prior and likelihood distributions
+empirical_prior_ph_FL <- FL_ph
+model_predictions_ph <- sg_dist_ph
+#model_predictions_ph <- sg_dist_ph_syn
+# Perform Bayesian updating
+posterior_samples_ph_FL <- bayesian_update(
+  prior_distribution = empirical_prior_ph, 
+  likelihood_distribution = model_predictions_ph
+)
+
+
+
+# Simulate prior and likelihood distributions
+empirical_prior_cec <- unlist(combined_data_cec)
+model_predictions_cec <- sg_dist_cec
+
+# Perform Bayesian updating
+posterior_samples_cec <- bayesian_update(
+  prior_distribution = empirical_prior_cec, 
+  likelihood_distribution = model_predictions_cec
+)
+
+calculate_summary_statistics(empirical_prior_clay, percentile_probs = c(0.05, 0.5, 0.95))
+calculate_summary_statistics(model_predictions_clay, percentile_probs = c(0.05, 0.5, 0.95))
+calculate_summary_statistics(posterior_samples_clay, percentile_probs = c(0.05, 0.5, 0.95))
+
+calculate_summary_statistics(empirical_prior_ph, percentile_probs = c(0.05, 0.5, 0.95))
+calculate_summary_statistics(model_predictions_ph, percentile_probs = c(0.05, 0.5, 0.95))
+calculate_summary_statistics(posterior_samples_ph, percentile_probs = c(0.05, 0.5, 0.95))
+
+calculate_summary_statistics(empirical_prior_cec, percentile_probs = c(0.05, 0.5, 0.95))
+calculate_summary_statistics(model_predictions_cec, percentile_probs = c(0.05, 0.5, 0.95))
+calculate_summary_statistics(posterior_samples_cec, percentile_probs = c(0.05, 0.5, 0.95))
+
+# Combine distributions into a data frame for visualization
+data_clay <- data.frame(
+  Value = c(empirical_prior_clay, model_predictions_clay, posterior_samples_clay),
+  Distribution = factor(c(
+    rep("Prior (HWSD)", length(empirical_prior_clay)),
+    rep("Likelihood (SoilGrids2-QRF predictions at selected pixel)", length(model_predictions_clay)),
+    rep("Posterior (HWSD Constrained SoilGrids)", length(posterior_samples_clay))
+  ))
+)
+
+data_ph <- data.frame(
+  Value = c(empirical_prior_ph, model_predictions_ph, posterior_samples_ph),
+  Distribution = factor(c(
+    rep("Prior (HWSD)", length(empirical_prior_ph)),
+    rep("Likelihood (SoilGrids2-QRF predictions at selected pixel)", length(model_predictions_ph)),
+    rep("Posterior (HWSD Constrained SoilGrids)", length(posterior_samples_ph))
+  ))
+)
+
+data_ph_FL <- data.frame(
+  Value = c(empirical_prior_ph_FL[[1]], model_predictions_ph, posterior_samples_ph_FL),
+  Distribution = factor(c(
+    rep("Prior (HWSD)", length(empirical_prior_ph_FL[[1]])),
+    rep("Likelihood (SoilGrids2-QRF predictions at selected pixel)", length(model_predictions_ph)),
+    rep("Posterior (HWSD Constrained SoilGrids)", length(posterior_samples_ph_FL))
+  ))
+)
+
+data_cec <- data.frame(
+  Value = c(empirical_prior_cec, model_predictions_cec, posterior_samples_cec),
+  Distribution = factor(c(
+    rep("Prior (HWSD)", length(empirical_prior_cec)),
+    rep("Likelihood (SoilGrids2-QRF predictions at selected pixel)", length(model_predictions_cec)),
+    rep("Posterior (HWSD Constrained SoilGrids)", length(posterior_samples_cec))
+  ))
+)
+
+# Visualize the distributions
+ggplot(data_cec, aes(x = Value, fill = Distribution)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Bayesian Updating for %Clay",
+       x = "Clay (%)",
+       y = "Density") +
+  theme_minimal() +
+  scale_fill_manual(values = c("skyblue", "salmon", "lightgreen")) +
+  scale_x_continuous(limits = c(0.0, 70.0), breaks = seq(0.5, 2.0, by = 0.1))
+```
+
+```{r}
+plot_distributions_and_save <- function(data, distributions_to_plot, prop, highlight_last = TRUE, 
+                                        x_limits = c(0, 70), plot_title = "Bayesian Updating for %Clay", 
+                                        x_axis_label = "Clay (%)", legend_position = c(0.2, 0.8)) {
+  # # Create the output directory if it doesn't exist
+  # if (!dir.exists(output_dir)) {
+  #   dir.create(output_dir, recursive = TRUE)
+  # }
+  
+  # Ensure Value column is numeric
+  data <- data %>%
+    mutate(Value = as.numeric(Value))
+  
+  # Calculate densities for all distributions
+  all_density_data <- data %>%
+    group_by(Distribution) %>%
+    summarise(density_max = max(density(Value)$y, na.rm = TRUE))
+  
+  # Find the maximum density across all distributions
+  y_max <- max(all_density_data$density_max, na.rm = TRUE)
+  y_max <- y_max + (y_max *0.05)
+  # Reorder Distribution factor based on the specified order
+  data <- data %>%
+    filter(Distribution %in% distributions_to_plot) %>%
+    mutate(
+      Distribution = factor(Distribution, levels = distributions_to_plot),
+      alpha_value = ifelse(Distribution == distributions_to_plot[length(distributions_to_plot)], 0.8, 0.5)
+    )
+  
+
+  
+  # Assign colors to distributions
+  colors <- c("Prior (HWSD)" = "skyblue", 
+              "Likelihood (SoilGrids2-QRF predictions at selected pixel)" = "salmon", 
+              "Posterior (HWSD Constrained SoilGrids)" = "lightgreen", "New Prior (HWSD Constrained SoilGrids)" = "skyblue", "Likelihood (Measured pH + error)" = "salmon", "New Posterior (Field Measurement Constrained)"= "lightgreen")
+  
+  # Generate the plot
+  plot <- ggplot(data, aes(x = Value, fill = Distribution, alpha = alpha_value)) +
+    geom_density(color = "black") +
+    labs(
+      title = plot_title,          # Customizable title
+      x = x_axis_label,            # Customizable x-axis label
+      y = "Density"                # Fixed y-axis label
+    ) +
+    theme_minimal() +
+    scale_fill_manual(values = colors[distributions_to_plot], name = "Distributions") +
+    scale_alpha_identity() +  # Use the `alpha` column directly
+    scale_x_continuous(limits = x_limits) +  # Set x-axis limits
+    scale_y_continuous(limits = c(0, y_max)) +  # Scale y-axis to the max density
+    theme(
+      legend.position = legend_position, # Adjust legend position
+      legend.justification = c("left", "top")  # Optional: fine-tune alignment
+    )
+  
+  # Save the plot to a PNG file
+  output_file <- file.path("C:/R_Drive/Data_Files/LPKS_Data/R_Projects/HWSD.V2/report/figures", paste0(prop, paste(distributions_to_plot, collapse = "_"), ".png"))
+  ggsave(output_file, plot = plot, width = 10, height = 6, dpi = 300)
+  
+  # Return the plot (optional)
+  return(plot)
+}
+
+
+```
+
+```{r}
+
+# Example Usage
+
+dist1 <- c("Prior (HWSD)")
+dist2 <- c("Prior (HWSD)",
+  "Likelihood (SoilGrids2-QRF predictions at selected pixel)")
+dist3 <- c(
+  "Prior (HWSD)",
+  "Likelihood (SoilGrids2-QRF predictions at selected pixel)",
+  "Posterior (HWSD Constrained SoilGrids)"
+)
+dist3.1 <- c(
+  "Posterior (HWSD Constrained SoilGrids)"
+)
+
+data_cec <- data_cec %>%
+  filter(!is.na(Value) & is.finite(Value))
+
+#clay
+plot_distributions_and_save(
+  data_clay, 
+  dist3,  #alter dist number
+  prop="Clay", 
+  x_limits = c(0, 100), 
+  plot_title = "HWSD Surface Clay Distributions", 
+  x_axis_label = "% Clay",
+  legend_position = c(0.4, 0.9)  # Move legend further to the left
+)
+
+#pH
+plot_distributions_and_save(
+  data_ph_FL, 
+  dist1,  #alter dist number
+  prop="pH_FL", 
+  x_limits = c(3.5, 8.5), 
+  plot_title = "", 
+  x_axis_label = "pH",
+  legend_position = c(0.1, 0.9)  # Move legend further to the left
+)
+
+#cec
+plot_distributions_and_save(
+  data_cec, 
+  dist3,  #alter dist number
+  prop="CEC", 
+  x_limits = c(0, 100), 
+  plot_title = "HWSD Surface CEC Distributions", 
+  x_axis_label = "CEC cmol(+) kg⁻¹",
+  legend_position = c(0.4, 0.9)  # Move legend further to the left
+)
+
+
+```
+
+
+
+```{r}
+# Set parameters for the normal distribution
+mean_pH <- 5.5
+sd_pH <- 0.3
+
+# Simulate 1000 values from the normal distribution
+simulated_pH_values <- rnorm(1000, mean = mean_pH, sd = sd_pH)
+
+# Create a data frame for plotting
+pH_data <- data.frame(Value = simulated_pH_values)
+
+# Load ggplot2 for plotting
+library(ggplot2)
+
+# Plot the density of the simulated values
+ggplot(pH_data, aes(x = Value)) +
+  geom_density(fill = "blue", alpha = 0.4, color = "darkblue", lwd = 1) +
+  geom_vline(
+    xintercept = mean_pH,  # Vertical line at the mean
+    linetype = "dashed", 
+    color = "red",
+    lwd = 1
+  ) +
+  labs(
+    title = "Measured pH + error",
+    x = "pH",
+    y = "Density"
+  ) +
+  scale_x_continuous(limits = c(4, 8)) +  # Adjust x-axis limits
+  theme_minimal()
+
+
+# Simulate prior and likelihood distributions
+new_prior_ph <- posterior_samples_ph
+measured_ph <- simulated_pH_values
+#model_predictions_ph <- sg_dist_ph_syn
+# Perform Bayesian updating
+updated_posterior_samples_ph <- bayesian_update(
+  prior_distribution = new_prior_ph, 
+  likelihood_distribution = measured_ph
+)
+
+data_ph_measured <- data.frame(
+  Value = c(new_prior_ph, measured_ph, updated_posterior_samples_ph),
+  Distribution = factor(c(
+    rep("New Prior (HWSD Constrained SoilGrids)", length(new_prior_ph)),
+    rep("Likelihood (Measured pH + error)", length(measured_ph)),
+    rep("New Posterior (Field Measurement Constrained)", length(updated_posterior_samples_ph))
+  ))
+)
+
+# Example Usage
+dist4 <- c("New Prior (HWSD Constrained SoilGrids)")
+dist5 <- c("New Prior (HWSD Constrained SoilGrids)",
+  "Likelihood (Measured pH + error)")
+dist6 <- c(
+  "New Prior (HWSD Constrained SoilGrids)",
+  "Likelihood (Measured pH + error)",
+  "New Posterior (Field Measurement Constrained)"
+)
+
+#pH
+plot_distributions_and_save(
+  data_ph_measured, 
+  dist6,  #alter dist number
+  prop="pH_update", 
+  x_limits = c(3.5, 8.5), 
+  plot_title = "", 
+  x_axis_label = "pH",
+  legend_position = c(0.1, 0.9)  # Move legend further to the left
+)
+```
+
+
+```{r}
+selected_distributions <- c("Prior (HWSD)")
+plot_distributions(data_cec, selected_distributions)
+
+selected_distributions <- c("Prior (HWSD)", "Posterior (HWSD Constrained SoilGrids)")
+plot_distributions(data_cec, selected_distributions)
+
+selected_distributions <- c(
+  "Prior (HWSD)",
+  "Likelihood (SoilGrids2-QRF predictions at selected pixel)",
+  "Posterior (HWSD Constrained SoilGrids)"
+)
+plot_distributions(data_cec, selected_distributions)
+
+```
+
+
+```{r}
+# Load required libraries
+library(leaflet)
+library(sf)
+library(rnaturalearth)  # For country boundary data
+
+# Define the point in Ghana
+point <- data.frame(
+  lon = -1.4631, # Longitude
+  lat = 7.3318   # Latitude
+)
+
+# Load Ghana boundary
+ghana_boundary <- ne_countries(scale = "medium", country = "Ghana", returnclass = "sf")
+
+# Create an interactive map
+leaflet() %>%
+  addProviderTiles(providers$Esri.WorldImagery) %>%  # High-resolution satellite imagery
+  addPolygons(
+    data = ghana_boundary,
+    color = "blue",
+    weight = 2,
+    fillOpacity = 0.1,
+    popup = ~name
+  ) %>%
+  addCircleMarkers(
+    data = point,
+    ~lon, ~lat,
+    color = "red",
+    radius = 5,
+    popup = ~paste0("Point: (", lon, ", ", lat, ")")
+  ) %>%
+  addLabelOnlyMarkers(
+    data = ghana_boundary,
+    lng = st_coordinates(st_centroid(ghana_boundary))[1],
+    lat = st_coordinates(st_centroid(ghana_boundary))[2],
+    label = ~name,
+    labelOptions = labelOptions(noHide = TRUE, direction = "top", textOnly = TRUE)
+  ) %>%
+  addScaleBar(position = "bottomleft")
+
+```
+
+
+
+

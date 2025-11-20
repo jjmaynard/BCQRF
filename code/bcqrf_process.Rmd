@@ -1,0 +1,341 @@
+---
+title: "US Testing of Bayesian Constrained Quantile Regression Forest"
+output: html_notebook
+author: Jonathan Maynard
+---
+
+```{r}
+library(terra)
+library(soilDB)
+library(soiltexture)
+library(aqp)
+library(here)
+#source(here("code/local_functions.R"))
+
+# Define lookup table for general soil properties and their corresponding SoilGrids, SOLUS, and SSURGO labels
+lookup_table <- data.frame(
+  Property = c(
+    "BulkDensity", "CEC", "CoarseFrag", "Clay", "pH", "Sand", "Silt", "SOC"
+  ),
+  SoilGrids_Label = c(
+    "bdod", "cec", "cfvo", "clay", "phh2o", "sand", "silt", "soc"
+  ),
+  SOLUS_Label = c(
+    "dbovendry", "cec7", "fragvol", "claytotal", "ph1to1h2o", "sandtotal", "silttotal", "soc"
+  ),
+  SSURGO_Label_Low = c(
+    "dbthirdbar_l", "cec7_l", "chf.fragvol_l AS rfv_l", "claytotal_l", "ph1to1h2o_l", "sandtotal_l", "silttotal_l", "om_l"
+  ),
+  SSURGO_Label_Rep = c(
+    "dbthirdbar_r", "cec7_r", "chf.fragvol_r AS rfv_r", "claytotal_r", "ph1to1h2o_r", "sandtotal_r", "silttotal_r", "om_r"
+  ),
+  SSURGO_Label_High = c(
+    "dbthirdbar_h", "cec7_h", "chf.fragvol_h AS rfv_h", "claytotal_h", "ph1to1h2o_h", "sandtotal_h", "silttotal_h", "om_h"
+  )
+)
+
+```
+
+```{r}
+
+#' Download Soil Data Sources
+#'
+#' This function downloads and processes soil data from multiple sources (SSURGO, SOLUS, and SoilGrids)
+#' for a given area of interest (AOI) specified by a Well-Known Text (WKT) geometry, and for a set of soil
+#' properties. It performs the following steps:
+#' 
+#' 1. Defines a lookup table mapping general soil properties to their corresponding labels in SoilGrids,
+#'    SOLUS, and SSURGO.
+#' 2. Converts the AOI WKT to a spatial object, reprojects it to EPSG:5070, and creates a polygon.
+#' 3. Fetches SSURGO data via a spatial query, rasterizes the data, and extracts its categorical attribute table (RAT).
+#' 4. Constructs and submits an SQL query to retrieve SSURGO soil property data.
+#' 5. If "CoarseFrag" is among the requested properties, it aggregates rock fragment volumes.
+#' 6. Merges the aggregated data back into the RAT and "catalyzes" the raster.
+#' 7. Fetches SOLUS data and SoilGrids data for the AOI, reprojects them to match the SSURGO data, and
+#'    finally combines all data layers.
+#'
+#' @param aoi_wkt A character string containing the Well-Known Text (WKT) representation of the area of interest.
+#' @param properties A character vector of soil properties to download (e.g., "BulkDensity", "CEC", "Clay", "pH", etc.).
+#'
+#' @return A list of spatial soil data layers combining SSURGO, SOLUS, and SoilGrids sources.
+#'
+#' @examples
+#' \dontrun{
+#'   aoi_wkt <- "POLYGON((-122.5 37.7, -122.5 37.8, -122.4 37.8, -122.4 37.7, -122.5 37.7))"
+#'   properties <- c("BulkDensity", "CEC", "Clay", "pH", "Sand", "Silt", "SOC")
+#'   soil_layers <- download_soil_data_sources(aoi_wkt, properties)
+#'   plot(soil_layers[[1]])
+#' }
+#'
+#' @import dplyr
+#' @import terra
+#' @import soilDB
+#' @export
+download_soil_data_sources <- function(aoi_wkt, properties) {
+  # Define lookup table for general soil properties and their corresponding SoilGrids, SOLUS, and SSURGO labels
+  lookup_table <- data.frame(
+    Property = c("db", "cec", "rfv", "clay", "ph", "sand", "silt", "soc"),
+    SoilGrids_Label = c("bdod", "cec", "cfvo", "clay", "phh2o", "sand", "silt", "soc"),
+    SOLUS_Label = c("dbovendry", "cec7", "fragvol", "claytotal", "ph1to1h2o", "sandtotal", "silttotal", "soc", "resdept"),
+    SSURGO_Label_Low = c("dbovendry_l", "cec7_l", "chf.fragvol_l AS rfv_l", "claytotal_l", "ph1to1h2o_l", "sandtotal_l", "silttotal_l", "om_l"),
+    SSURGO_Label_Rep = c("dbovendry_r", "cec7_r", "chf.fragvol_r AS rfv_r", "claytotal_r", "ph1to1h2o_r", "sandtotal_r", "silttotal_r", "om_r"),
+    SSURGO_Label_High = c("dbovendry_h", "cec7_h", "chf.fragvol_h AS rfv_h", "claytotal_h", "ph1to1h2o_h", "sandtotal_h", "silttotal_h", "om_h"),
+    stringsAsFactors = FALSE
+  )
+  
+  # Soil property lookup selection based on requested properties
+  props <- lookup_table[lookup_table$Property %in% properties, ]
+  
+  # Convert AOI WKT to spatial object and reproject to EPSG:5070 using terra functions
+  aoi <- terra::vect(aoi_wkt, crs = "epsg:4326")
+  aoi <- terra::project(aoi, "epsg:5070")
+  aoi <- terra::as.polygons(terra::ext(aoi), crs = "epsg:5070")
+  
+  # -------------------------------------------------------------------------------------------------------------------------------
+  # SSURGO Processing
+  # -------------------------------------------------------------------------------------------------------------------------------
+  
+  ## Fetch SSURGO data
+  mu <- soilDB::mukey.wcs(aoi = aoi, db = "gssurgo")
+  ssurgo_p <- soilDB::SDA_spatialQuery(aoi, what = "mupolygon", db = "SSURGO", geomIntersection = TRUE)
+  ssurgo_p <- terra::project(ssurgo_p, "epsg:5070")
+  ssurgo <- terra::rasterize(ssurgo_p, mu, field = "mukey")
+  ssurgo <- terra::as.factor(ssurgo)
+  
+  # Extract RAT for thematic mapping
+  rat <- terra::cats(ssurgo)[[1]]
+  
+  # Format mukey(s) and property(s) for SQL
+  formatted_mukey <- paste0("(", paste0("'", as.integer(rat$mukey), "'", collapse = ","), ")")
+  ssurgo_variables <- c(props$SSURGO_Label_Low, props$SSURGO_Label_Rep, props$SSURGO_Label_High)
+  formatted_properties <- paste(na.omit(ssurgo_variables), collapse = ", ")
+  
+  # Construct the SQL query
+  query <- sprintf(
+    "
+    SELECT
+      -- contextual data
+      co.mukey, co.cokey, compname, comppct_l, comppct_r, comppct_h,
+      -- horizon morphology
+      ch.chkey, hzname, hzdept_l, hzdept_r, hzdept_h, hzdepb_l, hzdepb_r, hzdepb_h, hzthk_l, hzthk_r, hzthk_h,
+      -- soil property parameters
+      %s
+    FROM mapunit AS mu
+      INNER JOIN component AS co ON mu.mukey = co.mukey
+      INNER JOIN chorizon AS ch ON co.cokey = ch.cokey
+      LEFT JOIN chfrags AS chf ON ch.chkey = chf.chkey
+    WHERE mu.mukey IN %s
+    ORDER BY co.cokey, ch.hzdept_r ASC;",
+    formatted_properties, formatted_mukey
+  )
+  
+  # Submit the query and fetch results using soilDB
+  ssurgo_data <- soilDB::SDA_query(query)
+  
+  if ("CoarseFrag" %in% ssurgo_variables) {
+    # Group by `chkey` and sum rock fragment values (rfv_l, rfv_r, rfv_h) using dplyr
+    rfv_sum <- ssurgo_data %>%
+      dplyr::group_by(chkey) %>%
+      dplyr::summarise(
+        rfv_l = sum(rfv_l, na.rm = TRUE),
+        rfv_r = sum(rfv_r, na.rm = TRUE),
+        rfv_h = sum(rfv_h, na.rm = TRUE)
+      ) %>%
+      dplyr::ungroup()
+    
+    # Merge the summed values back to the main dataset and remove duplicates
+    ssurgo_data <- ssurgo_data %>%
+      dplyr::select(-dplyr::all_of(c("rfv_l", "rfv_r", "rfv_h"))) %>%
+      dplyr::left_join(rfv_sum, by = "chkey") %>%
+      dplyr::distinct()
+  }
+  
+  #mukey-wise calcualtion of simulated comppct
+  ssurgo_comppct_sim <- ssurgo_data %>%
+    group_by(mukey) %>%
+    do({
+      # Apply sim_component_comp to each group (subset) of rows
+      sim_component_comp(., n_simulations = 1000)
+    }) %>% ungroup()
+  
+  
+  ssurgo_data <- ssurgo_data %>% left_join(ssurgo_comppct_sim %>% dplyr::select(cokey, sim_comppct), by="cokey")
+  
+  # Remove organic layers if present
+  if (any(grepl("O", ssurgo_data$hzname))) {
+    ssurgo_data <- remove_organic_layer(ssurgo_data)
+  }
+  
+  # Create a Soil Profile Collection
+  ssurgo_data <- ssurgo_data %>% as.data.frame()
+  depths(ssurgo_data) <- id ~ hzdept_r + hzdepb_r
+  hzdesgnname(ssurgo_data) <- "hzname"
+  res <- checkHzDepthLogic(ssurgo_data)
+  # Simulate soil profile horizon depth variability
+  ssurgo_depth_simulation <- simulate_profile_depths_by_collection_parallel(ssurgo_data, seed = 123, n_cores = 6)
+  
+  
+  
+  # Merge aggregate soil data into RAT
+  rat <- base::merge(rat, ssurgo_data, by.x = "mukey", by.y = "mukey", sort = FALSE, all.x = TRUE)
+  
+  # Ensure that the grid cell ID (mukey) is numeric
+  rat$mukey <- as.integer(rat$mukey)
+  levels(ssurgo) <- rat
+  ssurgo <- aqp::catalyze(ssurgo)
+  
+  # -------------------------------------------------------------------------------------------------------------------------------
+  # SOLUS Processing
+  # -------------------------------------------------------------------------------------------------------------------------------
+  
+  ## Fetch SOLUS data
+  solus <- soilDB::fetchSOLUS(
+    aoi,
+    depth_slices = c("0", "5", "15", "30", "60", "100", "150"),
+    variables = na.omit(props$SOLUS_Label),
+    output_type = c("prediction", "95% low prediction interval", "95% high prediction interval"),
+    grid = TRUE
+  )
+  solus <- terra::project(solus, ssurgo)
+  
+  # -------------------------------------------------------------------------------------------------------------------------------
+  # SoilGrids Processing
+  # -------------------------------------------------------------------------------------------------------------------------------
+  
+  ## Fetch SoilGrids data
+  sg <- soilDB::fetchSoilGrids(
+    aoi, 
+    grid = TRUE, 
+    variables = na.omit(props$SoilGrids_Label), 
+    depth_intervals = c("0-5", "5-15", "15-30", "30-60", "60-100", "100-200"), 
+    summary_type = c("Q0.05", "Q0.5", "Q0.95", "mean")
+  )
+  sg <- terra::project(sg, ssurgo)
+  
+  ## Combine soil data layers
+  soil_layers <- c(ssurgo, solus, sg)
+  
+  return(soil_layers)
+}
+
+
+
+```
+
+
+```{r}
+
+# Example usage:
+aoi_wkt <- 'POLYGON((-101.7703 41.1811,-101.7703 41.3042,-101.4972 41.3042,-101.4972 41.1811,-101.7703 41.1811))'
+properties = "Clay"
+soil_data <- download_soil_data(aoi_wkt, properties)
+```
+
+
+
+
+```{r}
+download_and_plot_texture <- function(aoi_wkt) {
+
+    # Convert AOI WKT to spatial object and reproject
+  aoi <- vect(aoi_wkt, crs = 'epsg:4326')
+  aoi <- project(aoi, 'epsg:5070')
+  aoi <- as.polygons(ext(aoi), crs = 'epsg:5070')
+  
+  ## 1. Fetch SSURGO data
+  mu <- mukey.wcs(aoi = aoi, db = 'gssurgo')
+  ssurgo_p <- SDA_spatialQuery(aoi, what = 'mupolygon', db = 'SSURGO', geomIntersection = TRUE)
+  ssurgo_p <- project(ssurgo_p, 'epsg:5070')
+  ssurgo <- rasterize(ssurgo_p, mu, field = 'mukey')
+  ssurgo <- as.factor(ssurgo)
+  
+  # Extract RAT for thematic mapping
+  rat <- cats(ssurgo)[[1]]
+  
+  # variables of interest
+  vars <- c("sandtotal_l","sandtotal_r","sandtotal_h", "claytotal_l", "claytotal_r","claytotal_h")
+  
+  # get / aggregate specific horizon-level properties from SDA
+  p <- get_SDA_property(
+    property = vars,
+    method = "weighted average", 
+    mukeys = as.integer(rat$mukey),
+    include_minors = TRUE, 
+    miscellaneous_areas = FALSE,
+    top_depth = 29,
+    bottom_depth = 30
+  )
+  
+  # merge aggregate soil data into RAT
+  rat <- merge(rat, p, by.x = 'mukey', by.y = 'mukey', sort = FALSE, all.x = TRUE)
+  
+  # requires that grid cell ID (mukey) be numeric
+  rat$mukey <- as.integer(rat$mukey)
+  levels(ssurgo) <- rat
+  activeCat(ssurgo) <- 'claytotal_r'
+  ssurgo.stack <- catalyze(ssurgo)
+  
+  # Convert SSURGO to texture class
+  ssurgo_txt <- ssurgo
+  values(ssurgo_txt) <- ssc_to_texcl(
+    sand = values(ssurgo.stack$sandtotal_r), 
+    clay = values(ssurgo.stack$claytotal_r), 
+    droplevels = FALSE, 
+    simplify = TRUE
+  )
+  
+  .ct <- soilTextureColorPal(simplify = TRUE)
+  .ct <- merge(
+    levels(ssurgo_txt)[[1]],
+    .ct, 
+    by.x = 'label',
+    by.y = 'class',
+    sort = FALSE,
+    all.x = TRUE
+  )
+  coltab(ssurgo_txt) <- .ct[, c('value', 'color')]
+
+  ## 2. Fetch SOLUS data
+  solus <- fetchSOLUS(
+    aoi,
+    depth_slices = c("0", "5", "15", "30", "60", "100", "150"),
+    variables = c("sandtotal", "claytotal", "cec7", "resdept"),
+    output_type = "prediction",
+    grid = TRUE
+  )
+  
+  ## 3. Compute Texture Class for SOLUS
+  solus_texture <- solus[[1]]
+  values(solus_texture) <- ssc_to_texcl(
+    sand = values(solus$sandtotal_30_cm_p), 
+    clay = values(solus$claytotal_30_cm_p), 
+    droplevels = FALSE, 
+    simplify = TRUE
+  )
+  coltab(solus_texture) <- .ct[, c('value', 'color')]
+  
+  ## 4. Fetch SoilGrids Data
+  sg <- fetchSoilGrids(aoi, grid = TRUE, variables = c('sand', 'clay'), depth_intervals = '15-30', summary_type = 'mean')
+  sg_texture <- sg$`sand_mean_15-30cm`
+  values(sg_texture) <- ssc_to_texcl(
+    sand = values(sg$`sand_mean_15-30cm`), 
+    clay = values(sg$`clay_mean_15-30cm`), 
+    droplevels = FALSE, 
+    simplify = TRUE
+  )
+  coltab(sg_texture) <- .ct[, c('value', 'color')]
+  sg_texture <- project(sg_texture, ssurgo_txt)
+  
+  ## 6. Combine and Plot
+  g <- c(
+    ssurgo_txt,
+    resample(solus_texture, ssurgo_txt, method = 'near'),
+    sg_texture
+  )
+  
+  names(g) <- c('SSURGO (29-30cm) | 1:20k', 'SOLUS 100m (30cm) | 1:100k', 'SoilGrids 250m (15-30cm) | ?')
+  
+  plot(g, axes = FALSE, mar = c(0.5, 0.5, 2, 0), fun = function() lines(ssurgo_p), plg = list(cex = 1.5))
+}
+```
+

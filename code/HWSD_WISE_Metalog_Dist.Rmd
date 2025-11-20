@@ -1,0 +1,909 @@
+---
+title: "Simulating HWSD Profiles"
+output: html_notebook
+---
+
+# modified metalog functions (adpated from rmetalog package) that only rely on coefficients to recreate metalog distributions
+
+
+```{r}
+# Helper function: Newton's method to find probability for given quantile
+newtons_method <- function(coefficients, q, term, bounds, boundedness) {
+  alpha_step <- 0.01
+  err <- 1e-07
+  temp_err <- 0.1
+  y_now <- 0.5
+  i <- 1
+  while (temp_err > err) {
+    # Quantile function
+    quantile_val <- quantile_metalog(coefficients, y_now, term, bounds, boundedness)
+    
+    # PDF (density function)
+    density_val <- pdf_metalog(coefficients, y_now, term, bounds, boundedness)
+    
+    # Newton's method iteration
+    frist_function <- quantile_val - q
+    derv_function <- density_val
+    y_next <- y_now - alpha_step * (frist_function * derv_function)
+    temp_err <- abs(y_next - y_now)
+    
+    # Ensure y stays within valid bounds
+    y_next <- max(min(y_next, 0.99999), 1e-06)
+    y_now <- y_next
+    
+    # Stop if iteration limit is reached
+    i <- i + 1
+    if (i > 10000) {
+      stop(paste0("Approximation taking too long for quantile value: ", q, 
+                  ". Check distribution bounds or input parameters."))
+    }
+  }
+  return(y_now)
+}
+
+
+# Helper function: Quantile function
+quantile_metalog <- function(a, y, term, bounds, boundedness) {
+  f <- (y - 0.5)
+  l <- log(y / (1 - y))
+  x <- a[1] + a[2] * l + a[3] * f * l
+  if (term > 3) {
+    x <- x + a[4] * f
+  }
+  o <- 2
+  e <- 2
+  if (term > 4) {
+    for (i in 5:term) {
+      if (i %% 2 == 0) {
+        x <- x + a[i] * f^e * l
+        e <- e + 1
+      }
+      if (i %% 2 != 0) {
+        x <- x + a[i] * f^o
+        o <- o + 1
+      }
+    }
+  }
+  if (boundedness == "sl") {
+    x <- bounds[1] + exp(x)
+  }
+  if (boundedness == "su") {
+    x <- bounds[2] - exp(-x)
+  }
+  if (boundedness == "b") {
+    x <- (bounds[1] + bounds[2] * exp(x)) / (1 + exp(x))
+  }
+  return(x)
+}
+
+# Helper function: PDF (density function)
+pdf_metalog <- function(a, y, term, bounds, boundedness) {
+  d <- y * (1 - y)
+  f <- (y - 0.5)
+  l <- log(y / (1 - y))
+  x <- a[2] / d
+  if (a[3] != 0) {
+    x <- x + a[3] * ((f / d) + l)
+  }
+  if (term > 3) {
+    x <- x + a[4]
+  }
+  e <- 1
+  o <- 1
+  if (term > 4) {
+    for (i in 5:term) {
+      if (i %% 2 != 0) {
+        x <- x + ((o + 1) * a[i] * f^o)
+        o <- o + 1
+      }
+      if (i %% 2 == 0) {
+        x <- x + a[i] * (((f^(e + 1)) / d) + (e + 1) * (f^e) * l)
+        e <- e + 1
+      }
+    }
+  }
+  x <- (x^(-1))
+  if (boundedness != "u") {
+    M <- quantile_metalog(a, y, term, bounds = bounds, boundedness = "u")
+  }
+  if (boundedness == "sl") {
+    x <- x * exp(-M)
+  }
+  if (boundedness == "su") {
+    x <- x * exp(M)
+  }
+  if (boundedness == "b") {
+    x <- (x * (1 + exp(M))^2) / ((bounds[2] - bounds[1]) * exp(M))
+  }
+  return(x)
+}
+
+pdf_Metalog_density <- function(coefficients, term, bounds, boundedness, y) {
+  a <- coefficients
+  d <- y * (1 - y)
+  f <- (y - 0.5)
+  l <- log(y/(1 - y))
+  x <- (a[2]/d)
+  if (a[3] != 0) {
+    x <- x + a[3] * ((f/d) + l)
+  }
+  if (term > 3) {
+    x <- x + a[4]
+  }
+  e <- 1
+  o <- 1
+  if (term > 4) {
+    for (i in 5:term) {
+      if (i%%2 != 0) {
+        x <- x + ((o + 1) * a[i] * f^o)
+        o <- o + 1
+      }
+      if (i%%2 == 0) {
+        x <- x + a[i] * (((f^(e + 1))/d) + (e + 1) * 
+                           (f^e) * l)
+        e <- e + 1
+      }
+    }
+  }
+  x <- (x^(-1))
+  if (boundedness != "u") {
+    M <- quantile_metalog(a, y, term, bounds = bounds, boundedness = "u")
+  }
+  if (boundedness == "sl") {
+    x <- x * exp(-M)
+  }
+  if (boundedness == "su") {
+    x <- x * exp(M)
+  }
+  if (boundedness == "b") {
+    x <- (x * (1 + exp(M))^2)/((bounds[2] - bounds[1]) * 
+                                 exp(M))
+  }
+  return(x)
+}
+
+
+dmetalog_manual <- function(coefficients, q, term = 3, bounds = c(NA, NA), boundedness = "u") {
+
+  # Compute probabilities (y) for each quantile using Newton's method
+  probabilities <- sapply(q, newtons_method, coefficients = coefficients, term = term, bounds = bounds, boundedness = boundedness)
+  # Compute the density (PDF) for each probability
+  densities <- sapply(probabilities, pdf_Metalog_density, coefficients = coefficients, term = term, bounds = bounds, boundedness = boundedness)
+  return(densities)
+}
+
+rmetalog_manual <- function(coefficients, bounds = c(NA, NA), boundedness = "u", n = 1000) {
+    # Basic input checks
+    if (class(n) != "numeric" | n < 1 | n%%1 != 0) {
+        stop("Error: n must be a positive numeric integer.")
+    }
+    term = as.numeric(length(coefficients))
+    # Generate uniform random values
+    x <- stats::runif(n)
+    Y <- data.frame(y1 = rep(1, n))
+    Y$y2 <- (log(x / (1 - x)))
+    if (term > 2) {
+        Y$y3 <- (x - 0.5) * Y$y2
+    }
+    if (term > 3) {
+        Y$y4 <- x - 0.5
+    }
+    if (term > 4) {
+        for (i in 5:term) {
+            y <- paste0("y", i)
+            if (i%%2 != 0) {
+                Y[[y]] <- Y$y4^(i%/%2)
+            }
+            if (i%%2 == 0) {
+                z <- paste0("y", (i - 1))
+                Y[[y]] <- Y$y2 * Y[[z]]
+            }
+        }
+    }
+    
+    Y <- as.matrix(Y)
+    a <- matrix(coefficients)
+    s <- Y %*% a[1:term]
+    
+    # Handle different boundedness cases
+    if (boundedness == "sl") {
+        s <- bounds[1] + exp(s)
+    } else if (boundedness == "su") {
+        s <- bounds[2] - exp(-s)
+    } else if (boundedness == "b") {
+        s <- (bounds[1] + (bounds[2]) * exp(s))/(1 + exp(s))
+    }
+    
+    return(as.numeric(s))
+}
+
+```
+
+
+
+# Parametric distributions: Beta Distribution
+```{r}
+fit_beta_distribution <- function(min_val, max_val, mean, sd) {
+  # Rescale statistics to [0, 1]
+  scaled_mean <- (mean - min_val) / (max_val - min_val)
+  variance <- (sd / (max_val - min_val))^2
+  
+  # Estimate alpha and beta using method of moments
+  alpha <- ((1 - scaled_mean) / variance - 1 / scaled_mean) * scaled_mean^2
+  beta <- alpha * (1 / scaled_mean - 1)
+  
+  return(list(alpha = alpha, beta = beta))
+}
+
+simulate_from_beta <- function(n, min_val, max_val, mean, sd) {
+  params <- fit_beta_distribution(min_val, max_val, mean, sd)
+  simulated_data <- rbeta(n, params$alpha, params$beta)
+  
+  # Rescale data to [min_val, max_val]
+  rescaled_data <- min_val + simulated_data * (max_val - min_val)
+  return(rescaled_data)
+}
+
+# Test the function
+min_val <- 0
+max_val <- 10
+mean <- 5.5
+sd <- 2
+n <- 1000
+
+simulated_data <- simulate_from_beta(n, min_val, max_val, mean, sd)
+hist(simulated_data, breaks = 50, main = "Simulated Data from Beta Distribution", xlab = "Value")
+```
+
+
+# Functions for creating simulated distributions using quantiles: Desity method and Metalog method
+```{r}
+
+#' Generate a Density-Based Distribution from Dataframe Quantiles or Percentiles
+#'
+#' This function creates a simulated distribution based on the quantiles or percentiles provided
+#' in a dataframe. It first checks if all percentiles are present and not marked as -1; if so, it uses these
+#' for the simulation. If any percentiles are unavailable or marked as -1, it defaults to using the quantiles
+#' (Min, P25/Median, P75, Max). The function simulates dense points around each quantile or percentile
+#' using truncated normal distributions, then applies Kernel Density Estimation (KDE) to refine the distribution,
+#' which is truncated to fit within the provided minimum and maximum bounds.
+#'
+#' @param quantile_df A dataframe containing quantile and percentile values including mandatory
+#'   columns 'Min', 'Max', 'Median', 'P25', 'P75' and optional percentile columns 'P10', 'P20', 'P30', 'P40', 'P50',
+#'   'P60', 'P70', 'P80', 'P90'. If any percentile is marked as -1, the function defaults to quartile-based simulation.
+#' @param n Integer, the number of samples to generate from the final KDE, defaults to 1000.
+#' @param sample_size Integer, the number of points to simulate around each quantile/percentile for initial
+#'   density estimation, defaults to 10000.
+#'
+#' @return A numeric vector containing sampled values from the estimated density.
+#'   The length of this vector will be equal to the parameter `n`.
+#'
+#' @examples
+#' # Assuming 'df' is a dataframe that includes the necessary columns:
+#' set.seed(123)  # for reproducibility
+#' samples <- generate_density_based_distribution(df, n = 1000, sample_size = 10000)
+#' hist(samples, breaks = 30, main = "Simulated Distribution")
+#'
+#' @importFrom truncnorm rtruncnorm
+#' @export
+generate_density_based_distribution <- function(quantile_df, n = 1000, sample_size = 10000) {
+    # Define all possible quantiles and percentiles
+    quantile_cols <- c("Min", "Quart1", "Median", "Quart3", "Max")
+    percentile_cols <- c("P10", "P20", "P30", "P40", "P50", "P60", "P70", "P80", "P90")
+
+    # Check if dataframe contains required columns for both sets
+    all_quantile_present = all(quantile_cols %in% names(quantile_df))
+    all_percentile_present = all(percentile_cols %in% names(quantile_df)) && !any(quantile_df[1, percentile_cols] == -1)
+
+    # Choose which set to use based on the availability and completeness of percentiles
+    use_cols <- if (all_percentile_present) percentile_cols else quantile_cols
+
+    # Extract quantiles/percentiles from the dataframe and remove any NA values
+    quantiles <- unlist(quantile_df[1, use_cols], use.names = FALSE)
+    quantiles <- na.omit(quantiles)
+
+    # Check for sufficient quantile/percentile data
+    if (length(quantiles) <= 1) {
+        stop("Insufficient valid quantile/percentile data for density estimation.")
+    }
+
+    # Simulate dense points around each quantile/percentile
+    dense_points <- numeric(0)
+    for (i in 1:length(quantiles)) {
+        sd <- ifelse(i == 1 || i == length(quantiles),
+                     abs(quantiles[i] - quantiles[min(length(quantiles), i + 1)]) / 3,
+                     min(abs(quantiles[i] - quantiles[i - 1]), abs(quantiles[i] - quantiles[i + 1])) / 2)
+        sd <- max(sd, 0.1)
+
+        lower <- ifelse(i == 1, quantiles[1], -Inf)  # Min value
+        upper <- ifelse(i == length(quantiles), quantiles[length(quantiles)], Inf)  # Max value
+        dense_points <- c(dense_points, truncnorm::rtruncnorm(sample_size / length(quantiles), a = lower, b = upper, mean = quantiles[i], sd = sd))
+    }
+
+    # Apply KDE to the simulated dense points and truncate
+    d <- density(dense_points, adjust = 1, kernel = "gaussian", n = sample_size * 10)
+    in_range <- d$x >= quantile_df$Min & d$x <= quantile_df$Max
+    d$x <- d$x[in_range]
+    d$y <- d$y[in_range]
+    d$y <- d$y / sum(d$y)  # normalize to make it a proper density function
+
+    # Sample from the KDE
+    sampled_indices <- sample(length(d$x), n, replace = TRUE, prob = d$y)
+    samples <- d$x[sampled_indices]
+
+    return(samples)
+}
+
+
+#' Simulate a Metalog Distribution from Quantile Data
+#'
+#' This function fits a metalog distribution using available quantile data from a dataframe.
+#' It adjusts for missing percentile values using quartiles and median. The metalog distribution
+#' is fitted with up to 9 terms and simulations are generated from this distribution.
+#'
+#' @param quantile_df A dataframe containing quantile values including mandatory
+#'   columns 'Min', 'Max', 'Median', 'Quart1', 'Quart3' and optional percentile
+#'   columns 'P10', 'P20', 'P30', 'P40', 'P50', 'P60', 'P70', 'P80', 'P90'.
+#'   Missing percentiles marked as -1 will be replaced by the nearest appropriate quartile or median.
+#' @param n Integer, the number of samples to generate from the metalog distribution.
+#'
+#' @return A numeric vector containing sampled values from the metalog distribution.
+#'   The length of this vector will be equal to the parameter `n`.
+#'
+#' @examples
+#' # Assuming 'df' is a dataframe that includes the necessary columns:
+#' set.seed(123)  # for reproducibility
+#' samples <- simulate_metalog_distribution(df, n = 1000)
+#' hist(samples, breaks = 30, main = "Simulated Metalog Distribution")
+#'
+#' @export
+simulate_metalog_distribution <- function(quantile_df, n = 1000, term, boundedness = "b") {
+    
+  # Extract necessary quantiles from the dataframe, replacing -1 with NA for later adjustment
+    needed_cols <- c("Min", "P10", "P20", "Quart1", "P30", "P40", "P50", "P60", "P70", "Quart3", "P80", "P90", "Max")
+    quantiles <- quantile_df[1, needed_cols]
+    quantiles[quantiles == -1] <- NA
+    names(quantiles)[names(quantiles) == "Quart1"] <- "P25"
+    names(quantiles)[names(quantiles) == "Quart3"] <- "P75"
+
+    quantiles["P50"] <- ifelse(is.na(quantiles["P50"]), quantile_df$Median, quantiles["P50"])
+    quantiles <- quantiles[, !(names(quantiles) %in% "Median")]
+    na_columns <- colSums(is.na(quantiles)) == nrow(quantiles)
+    # Keep only those columns which do not have all NA values
+    quantiles <- quantiles[, !na_columns]
+    
+    # define bound
+    bounds = c(quantiles$Min, quantiles$Max)
+    quantiles <- quantiles[, !(names(quantiles) %in% c("Min", "Max"))]
+    
+    # Remove any NA values and check for sufficient data
+    quantiles <- na.omit(quantiles)
+    if (length(quantiles) <= 1) {
+        stop("Insufficient valid quantile data for density estimation.")
+    }
+    
+    # Order column names based on the extracted numbers
+    quantiles <- quantiles[order(as.numeric(gsub("[^0-9]", "", names(quantiles))))]
+    
+    p <- as.numeric(gsub("[^0-9]", "", names(quantiles)))/100
+    q <- as.numeric(quantiles)
+    term_lim <- min(length(q), 9)
+    # Fit the metalog distribution
+    metalog_fit <- metalog(q, probs = p, bounds = bounds, boundedness, term_limit = term_lim, step_len = 0.01)
+    # Given coefficients
+    term_num=metalog_fit$params$term_limit
+    term <- min(term_num, term)
+    amat <- paste0('a', term)
+    coefficients <- c(metalog_fit$A[[`amat`]])[1:term]
+    # Generate samples using the rmetalog_manual function
+    samples <- rmetalog_manual(coefficients, bounds = bounds, boundedness = 'b', n = n)
+
+    return(samples)
+}
+
+#' Calculate Summary Statistics for Numeric Data
+#'
+#' This function computes a comprehensive set of summary statistics for a given numeric vector.
+#' It checks that the input is numeric and calculates various measures including basic statistics,
+#' percentiles, quartiles, and distribution characteristics.
+#'
+#' @param data A numeric vector for which summary statistics are to be calculated.
+#'
+#' @return A data frame containing the following summary statistics:
+#'   - Number of observations (Num)
+#'   - Mean (Mean)
+#'   - Standard deviation (STD)
+#'   - Coefficient of variation (CV)
+#'   - Median (Median)
+#'   - Median absolute deviation (MAD)
+#'   - Minimum value (Min)
+#'   - Maximum value (Max)
+#'   - Variance (Var)
+#'   - 10th to 90th percentiles (P10, P20, ..., P90)
+#'   - First and third quartiles (Quart1, Quart3)
+#'   - Standard error of the mean (SE)
+#'
+#' @examples
+#' test_data <- rnorm(100, mean = 50, sd = 10)
+#' summary_stats <- calculate_summary_statistics(test_data)
+#' print(summary_stats)
+#'
+#' @export
+library(dplyr)
+library(tidyr)
+
+# Function to calculate summary statistics for a dataset
+calculate_summary_statistics <- function(data) {
+  summary_df <- data.frame(
+    Num = length(data),
+    Mean = mean(data, na.rm = TRUE),
+    STD = sd(data, na.rm = TRUE),
+    CV = (sd(data, na.rm = TRUE) / mean(data, na.rm = TRUE)) * 100,
+    Median = median(data, na.rm = TRUE),
+    MAD = mad(data, na.rm = TRUE),
+    Min = min(data, na.rm = TRUE),
+    Max = max(data, na.rm = TRUE),
+    Var = var(data, na.rm = TRUE),
+    P10 = quantile(data, 0.10, na.rm = TRUE),
+    P20 = quantile(data, 0.20, na.rm = TRUE),
+    P30 = quantile(data, 0.30, na.rm = TRUE),
+    P40 = quantile(data, 0.40, na.rm = TRUE),
+    P50 = quantile(data, 0.50, na.rm = TRUE),
+    P60 = quantile(data, 0.60, na.rm = TRUE),
+    P70 = quantile(data, 0.70, na.rm = TRUE),
+    P80 = quantile(data, 0.80, na.rm = TRUE),
+    P90 = quantile(data, 0.90, na.rm = TRUE),
+    Quart1 = quantile(data, 0.25, na.rm = TRUE),
+    Quart3 = quantile(data, 0.75, na.rm = TRUE),
+    SE = sd(data, na.rm = TRUE) / sqrt(length(data))
+  )
+  return(summary_df)
+}
+
+# Function to compare observed data with simulated distributions
+compare_to_simulations <- function(observed, beta, density, meta) {
+  # Calculate summary statistics
+  obs_stats <- observed[c("Num","Mean","STD","CV","Median","MAD","Min","Max","Var","P10","P20","P30","P40","P50","P60","P70","P80","P90","Quart1","Quart3","SE")]
+  sim1_stats <- calculate_summary_statistics(beta)
+  sim2_stats <- calculate_summary_statistics(density)
+  sim3_stats <- calculate_summary_statistics(meta)
+
+  # Merge all statistics into a single table
+  comparison_df <- bind_rows(
+    observed = obs_stats,
+    beta = sim1_stats,
+    density = sim2_stats,
+    meta = sim3_stats,
+    .id = "Dataset"
+  )
+
+  # Format the output for readability
+  comparison_df <- comparison_df %>%
+    pivot_longer(cols = -Dataset, names_to = "Metric", values_to = "Value") %>%
+    pivot_wider(names_from = Dataset, values_from = Value)
+
+  return(comparison_df)
+}
+
+
+simulate_comparision <- function(observed){
+  beta <- simulate_from_beta(n=10000, min_val=observed$Min, max_val=observed$Max, mean=observed$Mean, sd=observed$STD)
+  density <- generate_density_based_distribution(observed, n = 10000)
+  meta <- simulate_metalog_distribution(observed, n = 10000, term=3, boundedness = "b")
+  result <- compare_to_simulations(observed, beta, density, meta)
+  
+  result<- result %>%
+    mutate(across(where(is.numeric), ~ formatC(., format = "f", digits = 2)))
+
+  return(result)
+}
+
+out <- simulate_comparision(quantile_df[1,])
+
+```
+
+### Detailed Description of How the Function Works:
+
+1. **Input Parameters**: The function accepts a dataframe with multiple percentile values along with minimum and maximum values to define the distribution's shape and limits. The `n` parameter determines how many samples to return, while `sample_size` sets how many initial points to generate around each quantile.
+
+2. **Quantile Handling**: It starts by organizing the input quantiles and removing any invalid or missing data. If insufficient data is available, the function halts with an error message.
+
+3. **Density Simulation**: For each quantile, the function calculates a standard deviation and uses it to generate a set of points around that quantile using a truncated normal distribution, ensuring values fall between designated lower and upper bounds.
+
+4. **Kernel Density Estimation (KDE)**: Once points are generated, a KDE is applied to create a smooth density estimate. This density is manually truncated to fit within the specified `Min` and `Max` values, and normalized to ensure it sums to 1.
+
+5. **Sampling**: Finally, the function samples from this adjusted density to produce the final set of values, which are then returned.
+
+The `generate_density_based_distribution` function in R is designed to simulate a distribution based on specific quantile information provided by the user, incorporating a range of statistical measures from minimum and maximum values to various percentiles (P10, P20, ..., P90). The function operates in several distinct steps to create a realistic and smooth distribution from the input parameters.
+
+Initially, the function compiles the quantile values from a dataframe into a single vector and removes any missing or invalid entries, ensuring that only valid data is used for the density estimation. It checks to ensure there are sufficient data points to proceed; if not, it stops with an error message indicating the lack of valid quantile data.
+
+For each quantile, the function calculates a standard deviation based on the distance to its nearest neighbors, applying a unique adjustment for the edge quantiles (Min and Max). Using these calculated standard deviations, it generates dense points around each quantile through a truncated normal distribution. This distribution ensures that the points remain within specified bounds, effectively modeling the density around each quantile while adhering to the overall data constraints.
+
+Following the generation of dense points, the function employs Kernel Density Estimation (KDE) to smooth these points into a continuous density function. The KDE is adjusted to be truncated manually to remain within the minimum and maximum boundaries specified by the user, ensuring the final density does not extend beyond the provided limits. The density is then normalized, making sure it sums to one and represents a valid probability distribution.
+
+The final step involves sampling from this truncated and normalized KDE. The function selects a specified number of samples, based on the user's input, from this distribution. These samples represent the simulated values that are meant to mimic the empirical distribution defined by the initial quantile and boundary inputs.
+
+This function is an effective tool for generating a simulated distribution that closely matches specified percentile data while adhering to given minimum and maximum boundaries. 
+
+# Testing the two methods with HWSD data
+```{r}
+# WISE30sec statistical data
+stat_PLVR1 <- read.csv('C:/R_Drive/Data_Files/LPKS_Data/Data/Global_Soil_Maps/wise_30sec_v1/Interchangeable_format/stat_PLVR1.txt')
+stat_KSPH1 <- read.csv('C:/R_Drive/Data_Files/LPKS_Data/Data/Global_Soil_Maps/wise_30sec_v1/Interchangeable_format/stat_KSPH1.txt')
+stat_CMHS1 <- read.csv('C:/R_Drive/Data_Files/LPKS_Data/Data/Global_Soil_Maps/wise_30sec_v1/Interchangeable_format/stat_CMHS1.txt')
+stat_ACCL1 <- read.csv('C:/R_Drive/Data_Files/LPKS_Data/Data/Global_Soil_Maps/wise_30sec_v1/Interchangeable_format/stat_ACCL1.txt')
+
+# Merge the two data frames by Cluster_ID
+HW30s_p <- rbind(stat_PLVR1, stat_KSPH1, stat_CMHS1, stat_ACCL1)
+# Assuming df is your dataframe and Cluster_ID is the column to parse
+HW30s_p <- HW30s_p %>%
+  mutate(
+    FAO = str_sub(Cluster_ID, 1, 3),  # Extracts the first three characters regardless of case
+    Property = str_extract(Cluster_ID, "(?<=^[A-Za-z]{3})[A-Z]+"),  # Extracts capital letters following the first three characters
+    Climate = str_extract(Cluster_ID, "(?<=/)[A-Z]+(?=/)"),  # Extracts letters between the first and second slashes
+    Depth = str_split(Cluster_ID, "/", simplify = TRUE)[,3]  # Extracts everything after the second slash
+  )
+HW30s_p <- HW30s_p %>%
+  mutate(RowIndex = row_number())
+
+i=3981
+set.seed(123)
+simulated_density<- generate_density_based_distribution(HW30s_p[i,], n = 2000)
+set.seed(123)
+simulated_meta1 <- simulate_metalog_distribution(HW30s_p[i,], n = 2000, term = 5, boundedness = 'b')
+# fit metalog distribution to different sampling methods
+set.seed(123)
+metalog_fit2 <- metalog(x = simulated_density, term_limit = 9, bounds = c(min(simulated_density), max(simulated_density)), step_len = 0.01, boundedness = 'b')
+
+# Given coefficients
+term <- 5
+amat <- paste0('a', term)
+coefficients <- c(metalog_fit2$A[[`amat`]])[metalog_fit2$A[[`amat`]]!=0] 
+# Generate samples using the rmetalog_manual function
+simulated_meta2 <- rmetalog_manual(coefficients, bounds = metalog_fit2$params$bounds, boundedness = 'b', n = 2000)
+
+
+# Calculate common range for both datasets
+common_min <- min(min(simulated_density), min(simulated_meta1), min(simulated_meta2))
+common_max <- max(max(simulated_density), max(simulated_meta1), max(simulated_meta2))
+
+# Define breaks explicitly
+break_points <- seq(common_min, common_max, length.out = 101)  # creates 50 bins
+
+# Plot histograms with these breaks
+hist(simulated_density, breaks = break_points, main = "Empirical Distribution from Density Simulation", xlab = "Value", ylab = "Frequency", xlim = c(common_min, common_max))
+hist(simulated_meta1, breaks = break_points, main = "Empirical Distribution from Meta Simulation", xlab = "Value", ylab = "Frequency", xlim = c(common_min, common_max))
+hist(simulated_meta2, breaks = break_points, main = "Empirical Distribution from Meta Simulation", xlab = "Value", ylab = "Frequency", xlim = c(common_min, common_max))
+
+simulated_density_statistics <- calculate_summary_statistics(simulated_density)
+simulated_meta1_statistics <- calculate_summary_statistics(simulated_meta1)
+simulated_meta2_statistics <- calculate_summary_statistics(simulated_meta2)
+print(HW30s_p[i,])
+print(simulated_density_statistics)
+print(simulated_meta1_statistics)
+print(simulated_meta2_statistics)
+
+# In general it looks like 3 metalog terms might be sufficient to get a generalized characterization of the empirical distribution.
+```
+
+
+#metalog distribution
+```{r}
+library(rmetalog)
+
+# fit metalog distribution to different sampling methods
+metalog_fit <- metalog(x = simulated_density, term_limit = 9, bounds = c(min(simulated_density), max(simulated_density)), step_len = 0.01, boundedness = 'b')
+
+
+# Sample from the fitted metalog distribution
+# Generate quantile samples using the quantile function with uniform distribution
+set.seed(123)
+uniform_random_numbers <- runif(2000)  # 1000 uniform [0,1] random numbers
+set.seed(123)
+sampled_data1 <- rmetalog(metalog_fit, n = 2000, term=8)
+sampled_data2 <- qmetalog(metalog_fit, y = uniform_random_numbers, term=8)
+
+
+# Combine original and sampled data for plotting
+data_to_plot1 <- data.frame(value = c(simulated_density, sampled_data1),
+                           type = factor(c(rep("Original", length(simulated_density)), rep("Sampled", length(sampled_data1)))))
+
+data_to_plot2 <- data.frame(value = c(simulated_density, sampled_data2),
+                           type = factor(c(rep("Original", length(simulated_density)), rep("Sampled", length(sampled_data2)))))
+
+# Plot with 100 bins for Distribution 1
+ggplot(data_to_plot1, aes(x = value, fill = type)) +
+    geom_histogram(position = "identity", alpha = 0.5, bins =50) +  # Increased number of bins
+    labs(title = "Comparison of Original and Sampled Distributions 1: random-emp vs rmeta",
+         x = "Value",
+         y = "Frequency") +
+    scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    theme_minimal()
+
+# Plot with 100 bins for Distribution 2
+ggplot(data_to_plot2, aes(x = value, fill = type)) +
+    geom_histogram(position = "identity", alpha = 0.5, bins = 50) +  # Increased number of bins
+    labs(title = "Comparison of Original and Sampled Distributions 2: random-emp vs qmeta",
+         x = "Value",
+         y = "Frequency") +
+    scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    theme_minimal()
+
+# when a random seed is set, e.g., set.seed (123), results are same for empirical distribution creation as well as simulations from the metalog using random sampling and quantile sampling.
+
+```
+
+
+##Kolmogorov-Smirnov Test
+The Kolmogorov-Smirnov (KS) test results provide a comparison between the original example data (rainfall) and the data simulated from metalog distributions with increasing terms (from 2 to 9 terms). Each result includes a `D` statistic, which represents the maximum distance between the empirical cumulative distribution functions (CDFs) of the two datasets, and a p-value, which indicates the probability of observing a `D` statistic at least as extreme as the one observed under the null hypothesis that the distributions are the same.
+
+
+```{r}
+i=96
+set.seed(123)
+simulated_density<- generate_empirical_distribution_wise(HW30s_p[i,], n = 2000)
+
+# fit metalog distribution to different sampling methods
+metalog_fit <- metalog(x = simulated_density, term_limit = 9, bounds = c(min(simulated_density), max(simulated_density)), step_len = 0.01, boundedness = 'b')
+
+# Adjust the number of metalog terms and evaluate distribution fit
+
+set.seed(123)
+sampled_data1 <- rmetalog(metalog_fit, n = 2000, term=2)
+set.seed(123)
+sampled_data2 <- rmetalog(metalog_fit, n = 2000, term=3)
+set.seed(123)
+sampled_data3 <- rmetalog(metalog_fit, n = 2000, term=4)
+set.seed(123)
+sampled_data4 <- rmetalog(metalog_fit, n = 2000, term=5)
+set.seed(123)
+sampled_data5 <- rmetalog(metalog_fit, n = 2000, term=6)
+set.seed(123)
+sampled_data6 <- rmetalog(metalog_fit, n = 2000, term=7)
+set.seed(123)
+sampled_data7 <- rmetalog(metalog_fit, n = 2000, term=8)
+set.seed(123)
+sampled_data8 <- rmetalog(metalog_fit, n = 2000, term=9)
+
+#Plotting different numbers of terms
+data_to_plot1 <- data.frame(value = c(simulated_density, sampled_data1),
+                           type = factor(c(rep("Original", length(simulated_density)), rep("Sampled", length(sampled_data1)))))
+
+data_to_plot2 <- data.frame(value = c(simulated_density, sampled_data2),
+                           type = factor(c(rep("Original", length(simulated_density)), rep("Sampled", length(sampled_data2)))))
+
+data_to_plot3 <- data.frame(value = c(simulated_density, sampled_data3),
+                           type = factor(c(rep("Original", length(simulated_density)), rep("Sampled", length(sampled_data3)))))
+
+data_to_plot4 <- data.frame(value = c(simulated_density, sampled_data4),
+                           type = factor(c(rep("Original", length(simulated_density)), rep("Sampled", length(sampled_data4)))))
+
+data_to_plot5 <- data.frame(value = c(simulated_density, sampled_data5),
+                           type = factor(c(rep("Original", length(simulated_density)), rep("Sampled", length(sampled_data5)))))
+
+data_to_plot6 <- data.frame(value = c(simulated_density, sampled_data6),
+                           type = factor(c(rep("Original", length(simulated_density)), rep("Sampled", length(sampled_data6)))))
+
+data_to_plot7 <- data.frame(value = c(simulated_density, sampled_data7),
+                           type = factor(c(rep("Original", length(simulated_density)), rep("Sampled", length(sampled_data6)))))
+
+data_to_plot8 <- data.frame(value = c(simulated_density, sampled_data8),
+                           type = factor(c(rep("Original", length(simulated_density)), rep("Sampled", length(sampled_data6)))))
+
+
+
+# Plot with 100 bins for Distribution 1
+ggplot(data_to_plot1, aes(x = value, fill = type)) +
+    geom_histogram(position = "identity", alpha = 0.5, bins =50) +  # Increased number of bins
+    labs(title = "Comparison of Original and Sampled Distributions with 2 terms",
+         x = "Value",
+         y = "Frequency") +
+    scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    theme_minimal()
+
+# Plot with 100 bins for Distribution 2
+ggplot(data_to_plot2, aes(x = value, fill = type)) +
+    geom_histogram(position = "identity", alpha = 0.5, bins = 50) +  # Increased number of bins
+    labs(title = "Comparison of Original and Sampled Distributions with 3 terms",
+         x = "Value",
+         y = "Frequency") +
+    scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    theme_minimal()
+
+# Plot with 100 bins for Distribution 3
+ggplot(data_to_plot3, aes(x = value, fill = type)) +
+    geom_histogram(position = "identity", alpha = 0.5, bins =50) +  # Increased number of bins
+    labs(title = "Comparison of Original and Sampled Distributions with 4 terms",
+         x = "Value",
+         y = "Frequency") +
+    scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    theme_minimal()
+
+# Plot with 100 bins for Distribution 4
+ggplot(data_to_plot4, aes(x = value, fill = type)) +
+    geom_histogram(position = "identity", alpha = 0.5, bins = 50) +  # Increased number of bins
+    labs(title = "Comparison of Original and Sampled Distributions with 5 terms",
+         x = "Value",
+         y = "Frequency") +
+    scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    theme_minimal()
+
+# Plot with 100 bins for Distribution 5
+ggplot(data_to_plot5, aes(x = value, fill = type)) +
+    geom_histogram(position = "identity", alpha = 0.5, bins = 50) +  # Increased number of bins
+    labs(title = "Comparison of Original and Sampled Distributions with 6 terms",
+         x = "Value",
+         y = "Frequency") +
+    scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    theme_minimal()
+
+# Plot with 100 bins for Distribution 6
+ggplot(data_to_plot6, aes(x = value, fill = type)) +
+    geom_histogram(position = "identity", alpha = 0.5, bins = 50) +  # Increased number of bins
+    labs(title = "Comparison of Original and Sampled Distributions with 7 terms",
+         x = "Value",
+         y = "Frequency") +
+    scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    theme_minimal()
+
+# Plot with 100 bins for Distribution 7
+ggplot(data_to_plot7, aes(x = value, fill = type)) +
+    geom_histogram(position = "identity", alpha = 0.5, bins = 50) +  # Increased number of bins
+    labs(title = "Comparison of Original and Sampled Distributions with 8 terms",
+         x = "Value",
+         y = "Frequency") +
+    scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    theme_minimal()
+
+# Plot with 100 bins for Distribution 8
+ggplot(data_to_plot8, aes(x = value, fill = type)) +
+    geom_histogram(position = "identity", alpha = 0.5, bins = 50) +  # Increased number of bins
+    labs(title = "Comparison of Original and Sampled Distributions with 9 terms",
+         x = "Value",
+         y = "Frequency") +
+    scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    theme_minimal()
+
+# Assuming sampled_data and original_data are available
+# For Kolmogorov-Smirnov Test
+ks_test_result_T2 <- ks.test(simulated_density, sampled_data1)
+ks_test_result_T3 <- ks.test(simulated_density, sampled_data2)
+ks_test_result_T4 <- ks.test(simulated_density, sampled_data3)
+ks_test_result_T5 <- ks.test(simulated_density, sampled_data4)
+ks_test_result_T6 <- ks.test(simulated_density, sampled_data5)
+ks_test_result_T7 <- ks.test(simulated_density, sampled_data6)
+ks_test_result_T8 <- ks.test(simulated_density, sampled_data7)
+ks_test_result_T9 <- ks.test(simulated_density, sampled_data8)
+# Print the result
+
+print(ks_test_result_T2)
+print(ks_test_result_T3)
+print(ks_test_result_T4)
+print(ks_test_result_T5)
+print(ks_test_result_T6)
+print(ks_test_result_T7)
+print(ks_test_result_T8)
+print(ks_test_result_T9)
+
+```
+
+
+
+
+### KS Test Results Interpretation
+
+- **Goodness of Fit Increases:** There is a trend where the goodness of fit improves as the number of terms in the metalog increases, particularly noticeable from term 6 onwards, where p-values become very high, suggesting excellent fits.
+- **Choosing a Model:** The results from T6 onwards show no significant statistical advantage in increasing the number of terms beyond 6 in terms of improving the goodness of fit, as evidenced by similar or oscillating p-values.
+- **Practical Considerations:** Although increasing the number of terms generally provides a more flexible model that can capture complex data structures more accurately, it's essential to balance this with the risk of overfitting and increased computational cost. Based on these results, a model with 6 to 7 terms seems optimal given the high p-values and the very low `D` statistics.
+
+
+## Chi-squared Test
+The Chi-squared tests reveal how well the metalog distributions, with varying numbers of terms, fit the observed data of rainfall distributions. The Chi-squared statistic (`X-squared`) and the p-values together provide a quantitative measure of the discrepancies between expected frequencies derived from the metalog distributions and observed frequencies from the data. A very high Chi-squared value and extremely low p-value indicate a poor fit.
+```{r}
+# Chi-squared Test Function
+calculate_chi_squared <- function(original_data, metalog_object, num_terms, num_bins = 100) {
+  # Define histogram breaks based on the original data
+  breaks <- seq(min(original_data), max(original_data), length.out = num_bins + 1)
+  
+  # Calculate observed counts for each bin
+  observed_counts <- hist(original_data, breaks = breaks, plot = FALSE)$counts
+
+  # Simulate data from the metalog distribution
+  set.seed(123)  # for reproducibility
+  simulated_data <- rmetalog(metalog_object, n = as.numeric(length(original_data)), term = num_terms)
+  
+  # Calculate expected counts based on the simulated data
+  expected_counts <- hist(simulated_data, breaks = breaks, plot = FALSE)$counts
+
+  # Ensure all expected counts are greater than zero for the chi-squared test validity
+  if (any(expected_counts == 0)) {
+    warning("Some expected counts are zero; consider using more data or fewer bins.")
+    return(NA)
+  }
+
+  # Perform Chi-squared test
+  chi_squared_test_result <- chisq.test(x = observed_counts, p = expected_counts / sum(expected_counts), simulate.p.value = TRUE)
+
+  # Return the test result
+  return(chi_squared_test_result)
+}
+
+
+# Example usage:
+# Assuming 'original_data' is your dataset and 'metalog_fit' is your metalog model object
+chi_squared_T2 <- calculate_chi_squared(simulated_density, metalog_fit, num_terms = 2, num_bins = 50)
+chi_squared_T3 <- calculate_chi_squared(simulated_density, metalog_fit, num_terms = 3, num_bins = 50)
+chi_squared_T4 <- calculate_chi_squared(simulated_density, metalog_fit, num_terms = 4, num_bins = 50)
+chi_squared_T5 <- calculate_chi_squared(simulated_density, metalog_fit, num_terms = 5, num_bins = 50)
+chi_squared_T6 <- calculate_chi_squared(simulated_density, metalog_fit, num_terms = 6, num_bins = 50)
+chi_squared_T7 <- calculate_chi_squared(simulated_density, metalog_fit, num_terms = 7, num_bins = 50)
+chi_squared_T8 <- calculate_chi_squared(simulated_density, metalog_fit, num_terms = 8, num_bins = 50)
+chi_squared_T9 <- calculate_chi_squared(simulated_density, metalog_fit, num_terms = 9, num_bins = 50)
+
+# Print the result
+print(chi_squared_T2)
+print(chi_squared_T3)
+print(chi_squared_T4)
+print(chi_squared_T5)
+print(chi_squared_T6)
+print(chi_squared_T7)
+print(chi_squared_T8)
+print(chi_squared_T9)
+
+```
+
+### Interpretation of Chi-squared Test Results
+
+- **Trend Observation:** As the number of terms increases from 2 to 7, the Chi-squared statistics generally decrease and the p-values increase, indicating improved fit.
+- **Optimal Model Selection:** The 7-term model appears to provide the best balance between complexity and goodness of fit, as indicated by the Chi-squared statistic and the p-value.
+- **Further Considerations:** Although increasing terms generally improves fit, careful consideration should be given to model complexity and the potential for overfitting, especially when the improvements in fit become marginal (as seen from 7 to 9 terms).
+
+
+
+
+#simulate metalog distribution
+```{r}
+i=96
+set.seed(123)
+simulated_density<- generate_empirical_distribution_wise(HW30s_p[i,], n = 2000)
+
+# fit metalog distribution to different sampling methods
+
+# fit metalog to simulated values from empirical distribution
+metalog_fit <- metalog(x = simulated_density, term_limit = 9, bounds = c(min(simulated_density), max(simulated_density)), step_len = 0.01, boundedness = 'b')
+
+# fit metalog to WISE30sed data
+p <- c(0.10, 0.20, 0.25, 0.30, 0.40, 0.50, 0.60, 0.70, 0.75, 0.80, 0.90)
+y <- c(P10, P20, Quart1, P30, P40, P50, P60, P70, Quart3, P80, P90)
+
+# Set bounds using min and max values
+bounds <- c(min_val, max_val)
+
+# Fit the metalog distribution
+metalog_fit <- metalog(y, probs = p, bounds = bounds, boundedness = "b", term_limit = 9, step_len = 0.01)
+
+
+
+# 5 terms
+coefficients <- c(metalog_fit$A$a5)[metalog_fit$A$a5!=0] 
+n=1000
+min_val = metalog_fit$params$bounds[1]
+max_val = metalog_fit$params$bounds[2]
+
+set.seed(123)
+sim_meta2 <- rmetalog_manual(coefficients, bounds = c(min_val, max_val), boundedness = 'b', n = 2000)
+
+data_to_plot <- data.frame(value = c(simulated_density, sim_meta),
+                            type = factor(c(rep("Original", length(simulated_density)), rep("Sampled", length(sim_meta)))))
+
+ggplot(data_to_plot, aes(x = value, fill = type)) +
+    geom_histogram(position = "identity", alpha = 0.5, bins = 50) +  # Increased number of bins
+    labs(title = "Comparison of Original and Sampled Distributions",
+         x = "Value",
+         y = "Frequency") +
+    scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    theme_minimal()
+```
+
+

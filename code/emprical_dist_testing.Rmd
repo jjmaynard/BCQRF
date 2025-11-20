@@ -1,0 +1,462 @@
+---
+title: "Generating Empiricle Distributions from Percentiles"
+output: html_notebook
+---
+
+This script explores the generation of empirical distributions from percentiles
+
+```{r}
+estimate_empirical_distribution_single <- function(
+  min_val, 
+  p10, 
+  p20, 
+  p30, 
+  p40, 
+  p50, 
+  p60, 
+  p70, 
+  p80, 
+  p90, 
+  max_val
+) {
+  # 1) Collect x-values (the data values at given quantiles)
+  x_vals <- c(min_val, p10, p20, p30, p40, p50, p60, p70, p80, p90, max_val)
+  
+  # 2) Corresponding probabilities
+  p_vals <- seq(0, 1, length.out = length(x_vals))
+  
+  # 3) Create a piecewise-linear CDF
+  cdfFun <- approxfun(
+    x_vals, p_vals,
+    method = "linear",
+    yleft = 0,     # P(X <= x) = 0 for x < min_val
+    yright = 1     # P(X <= x) = 1 for x > max_val
+  )
+  
+  # 4) Create the inverse CDF (quantile function)
+  invcdfFun <- approxfun(
+    p_vals, x_vals,
+    method = "linear",
+    rule = 2  # extends boundary in a piecewise-constant manner
+  )
+  
+  # 5) Create a sampler
+  rFun <- function(n) {
+    u <- runif(n)
+    invcdfFun(u)
+  }
+  
+  # 6) Approx. PDF via finite-difference
+  pdfFun <- function(z) {
+    eps <- 1e-6
+    (cdfFun(z + eps) - cdfFun(z - eps)) / (2 * eps)
+  }
+  
+  # Return
+  list(
+    cdf      = cdfFun,
+    quantile = invcdfFun,
+    pdf      = pdfFun,
+    r        = rFun
+  )
+}
+
+estimate_empirical_distribution <- function(df) {
+  # Columns we need to build the piecewise distribution
+  needed_cols <- c("Min", "P10", "P20", "P30", "P40", "P50", 
+                   "P60", "P70", "P80", "P90", "Max")
+  
+  # Check that the data frame has these columns
+  if (!all(needed_cols %in% names(df))) {
+    stop("Data frame is missing one or more required columns: ",
+         paste(needed_cols, collapse = ", "))
+  }
+  
+  # Apply row by row, producing a list of distribution objects
+  result_list <- apply(df, 1, function(row_data) {
+    estimate_empirical_distribution_single(
+      min_val = row_data[["Min"]],
+      p10     = row_data[["P10"]],
+      p20     = row_data[["P20"]],
+      p30     = row_data[["P30"]],
+      p40     = row_data[["P40"]],
+      p50     = row_data[["P50"]],
+      p60     = row_data[["P60"]],
+      p70     = row_data[["P70"]],
+      p80     = row_data[["P80"]],
+      p90     = row_data[["P90"]],
+      max_val = row_data[["Max"]]
+    )
+  })
+  
+  # Return a list of distribution objects (one per row)
+  return(result_list)
+}
+
+```
+
+Example use case for estimate_empirical_distribution function:
+```{r}
+# Example minimal data frame with 2 rows
+df_example <- data.frame(
+  min_val = c(5, 10),
+  p10     = c(6.4, 12),
+  p20     = c(10.5, 14),
+  p30     = c(16, 16),
+  p40     = c(20.15, 18),
+  p50     = c(30, 25),
+  p60     = c(33.79, 28),
+  p70     = c(46.92, 32),
+  p80     = c(55.8, 35),
+  p90     = c(77.91, 45),
+  max_val = c(79.85, 50)
+)
+
+dist_list <- estimate_empirical_distribution(df_example)
+# dist_list is a list of 2 distribution objects (since df_example has 2 rows)
+
+# For example, to sample from the first distribution:
+samples_row1 <- dist_list[[1]]$r(1000)
+mean(samples_row1)
+quantile(samples_row1, probs = c(0.1, 0.5, 0.9))
+
+# Or from the second distribution:
+samples_row2 <- dist_list[[2]]$r(1000)
+mean(samples_row2)
+quantile(samples_row2, probs = c(0.1, 0.5, 0.9))
+```
+
+Code examines differnt approaches for random sampling of empiricle distribution
+```{r}
+# Create the estimated distribution for rainfall
+rainfall_dist <- estimate_empirical_distribution_single(
+  min_val = 200,
+  p10 = 300,
+  p20 = 350,
+  p30 = 400,
+  p40 = 450,
+  p50 = 500,
+  p60 = 550,
+  p70 = 600,
+  p80 = 650,
+  p90 = 700,
+  max_val = 800
+)
+
+# Generate random samples using the random sampling function
+set.seed(123)  # for reproducibility
+random_sampled_rainfall <- rainfall_dist$r(2000)
+
+# Generate quantile samples using the quantile function with uniform distribution
+set.seed(123)
+uniform_random_numbers <- runif(2000)  # 1000 uniform [0,1] random numbers
+quantile_sampled_rainfall <- rainfall_dist$quantile(uniform_random_numbers)
+
+# Combine the data for plotting
+combined_data <- data.frame(
+  Rainfall = c(random_sampled_rainfall, quantile_sampled_rainfall),
+  Method = factor(rep(c("Random Sampling", "Quantile Sampling"), each = 2000))
+)
+
+# Plotting the results using ggplot2
+
+ggplot(combined_data, aes(x = Rainfall, fill = Method)) +
+  geom_histogram(position = "identity", alpha = 0.5, bins = 30) +
+  labs(title = "Comparison of Sampling Methods",
+       x = "Rainfall (mm)",
+       y = "Frequency") +
+  scale_fill_manual(values = c("Random Sampling" = "blue", "Quantile Sampling" = "green")) +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+
+# Both simulation methods produce the same result
+```
+
+
+```{r}
+set.seed(123)  # for reproducibility
+random_sampled_rainfall <- rainfall_dist$r(2000)
+
+
+# fit metalog distribution to different sampling methods
+metalog_fit <- metalog(x = random_sampled_rainfall, term_limit = 9, bounds = c(min(random_sampled_rainfall ), max(random_sampled_rainfall)), step_len = 0.01, boundedness = 'b')
+
+
+# Sample from the fitted metalog distribution
+set.seed(123)
+sampled_data1 <- rmetalog(metalog_fit, n = 2000, term=4)
+sampled_data2 <- qmetalog(metalog_fit, y = uniform_random_numbers, term=4)
+
+
+# Combine original and sampled data for plotting
+data_to_plot1 <- data.frame(value = c(random_sampled_rainfall, sampled_data1),
+                           type = factor(c(rep("Original", length(random_sampled_rainfall)), rep("Sampled", length(sampled_data1)))))
+
+data_to_plot2 <- data.frame(value = c(random_sampled_rainfall, sampled_data2),
+                           type = factor(c(rep("Original", length(random_sampled_rainfall)), rep("Sampled", length(sampled_data2)))))
+
+# Plot with 100 bins for Distribution 1
+ggplot(data_to_plot1, aes(x = value, fill = type)) +
+    geom_histogram(position = "identity", alpha = 0.5, bins =50) +  # Increased number of bins
+    labs(title = "Comparison of Original and Sampled Distributions 1: random-emp vs rmeta",
+         x = "Value",
+         y = "Frequency") +
+    scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    theme_minimal()
+
+# Plot with 100 bins for Distribution 2
+ggplot(data_to_plot2, aes(x = value, fill = type)) +
+    geom_histogram(position = "identity", alpha = 0.5, bins = 50) +  # Increased number of bins
+    labs(title = "Comparison of Original and Sampled Distributions 2: random-emp vs qmeta",
+         x = "Value",
+         y = "Frequency") +
+    scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    theme_minimal()
+
+# when a random seed is set, e.g., set.seed (123), results are same for empirical distribution creation as well as simulations from the metalog using random sampling and quantile sampling.
+
+```
+
+
+The Kolmogorov-Smirnov (KS) test results provided show the comparison between your original rainfall data and the data simulated from metalog distributions with increasing terms (from 2 to 9 terms). Each result includes a `D` statistic, which represents the maximum distance between the empirical cumulative distribution functions (CDFs) of the two datasets, and a p-value, which indicates the probability of observing a `D` statistic at least as extreme as the one observed under the null hypothesis that the distributions are the same.
+
+Here's the interpretation of each test result:
+
+### KS Test Results Interpretation
+
+1. **Tests T2, T3, and T4:**
+   - **D Statistic:** 0.022 for all
+   - **P-value:** 0.7184 for all
+   - **Interpretation:** High p-values and low `D` statistics indicate that the simulated distributions (for terms 2, 3, and 4) do not differ significantly from the original rainfall data. The null hypothesis that the distributions are the same cannot be rejected.
+
+2. **Test T5:**
+   - **D Statistic:** 0.0235
+   - **P-value:** 0.6387
+   - **Interpretation:** A similar interpretation to the first three tests, but with a slightly lower p-value and slightly higher `D` statistic. There is still no significant evidence to reject the null hypothesis that the distributions are the same.
+
+3. **Test T6:**
+   - **D Statistic:** 0.0205
+   - **P-value:** 0.7947
+   - **Interpretation:** The lowest `D` statistic thus far, paired with a high p-value, suggests a very good match between the original and simulated data for 6 terms, indicating a strong similarity between the distributions.
+
+4. **Test T7:**
+   - **D Statistic:** 0.0155
+   - **P-value:** 0.9699
+   - **Interpretation:** Extremely high p-value and a low `D` statistic indicate that the distribution with 7 terms very closely matches the original data, suggesting an excellent fit.
+
+5. **Test T8:**
+   - **D Statistic:** 0.0175
+   - **P-value:** 0.9194
+   - **Interpretation:** Though the `D` statistic rises slightly compared to T7, the high p-value still indicates a close match between the observed and the simulated data for 8 terms.
+
+6. **Test T9:**
+   - **D Statistic:** 0.0155
+   - **P-value:** 0.9699
+   - **Interpretation:** Similar to T7, the high p-value and low `D` statistic with 9 terms also indicate an excellent fit, closely matching the original dataset.
+
+### Summary and Recommendations
+
+- **Goodness of Fit Increases:** There is a trend where the goodness of fit improves as the number of terms in the metalog increases, particularly noticeable from term 6 onwards, where p-values become very high, suggesting excellent fits.
+- **Choosing a Model:** The results from T6 onwards show no significant statistical advantage in increasing the number of terms beyond 6 in terms of improving the goodness of fit, as evidenced by similar or oscillating p-values.
+- **Practical Considerations:** Although increasing the number of terms generally provides a more flexible model that can capture complex data structures more accurately, it's essential to balance this with the risk of overfitting and increased computational cost. Based on these results, a model with 6 to 7 terms seems optimal given the high p-values and the very low `D` statistics.
+
+
+Adjust the number of metalog terms and evaluate distribution fit
+
+Plotting different numbers of terms
+```{r}
+# adjust terms 
+set.seed(123)
+sampled_data1 <- rmetalog(metalog_fit, n = 2000, term=2)
+set.seed(123)
+sampled_data2 <- rmetalog(metalog_fit, n = 2000, term=3)
+set.seed(123)
+sampled_data3 <- rmetalog(metalog_fit, n = 2000, term=4)
+set.seed(123)
+sampled_data4 <- rmetalog(metalog_fit, n = 2000, term=5)
+set.seed(123)
+sampled_data5 <- rmetalog(metalog_fit, n = 2000, term=6)
+set.seed(123)
+sampled_data6 <- rmetalog(metalog_fit, n = 2000, term=7)
+set.seed(123)
+sampled_data7 <- rmetalog(metalog_fit, n = 2000, term=8)
+set.seed(123)
+sampled_data8 <- rmetalog(metalog_fit, n = 2000, term=9)
+
+data_to_plot1 <- data.frame(value = c(rainfall_data$random_sampled_rainfall, sampled_data1),
+                           type = factor(c(rep("Original", length(rainfall_data$random_sampled_rainfall)), rep("Sampled", length(sampled_data1)))))
+
+data_to_plot2 <- data.frame(value = c(rainfall_data$random_sampled_rainfall, sampled_data2),
+                           type = factor(c(rep("Original", length(rainfall_data$random_sampled_rainfall)), rep("Sampled", length(sampled_data2)))))
+
+data_to_plot3 <- data.frame(value = c(rainfall_data$random_sampled_rainfall, sampled_data3),
+                           type = factor(c(rep("Original", length(rainfall_data$random_sampled_rainfall)), rep("Sampled", length(sampled_data3)))))
+
+data_to_plot4 <- data.frame(value = c(rainfall_data$random_sampled_rainfall, sampled_data4),
+                           type = factor(c(rep("Original", length(rainfall_data$random_sampled_rainfall)), rep("Sampled", length(sampled_data4)))))
+
+data_to_plot5 <- data.frame(value = c(rainfall_data$random_sampled_rainfall, sampled_data5),
+                           type = factor(c(rep("Original", length(rainfall_data$random_sampled_rainfall)), rep("Sampled", length(sampled_data5)))))
+
+data_to_plot6 <- data.frame(value = c(rainfall_data$random_sampled_rainfall, sampled_data6),
+                           type = factor(c(rep("Original", length(rainfall_data$random_sampled_rainfall)), rep("Sampled", length(sampled_data6)))))
+
+
+
+# Plot with 100 bins for Distribution 1
+ggplot(data_to_plot1, aes(x = value, fill = type)) +
+    geom_histogram(position = "identity", alpha = 0.5, bins =50) +  # Increased number of bins
+    labs(title = "Comparison of Original and Sampled Distributions with 2 terms",
+         x = "Value",
+         y = "Frequency") +
+    scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    theme_minimal()
+
+# Plot with 100 bins for Distribution 2
+ggplot(data_to_plot2, aes(x = value, fill = type)) +
+    geom_histogram(position = "identity", alpha = 0.5, bins = 50) +  # Increased number of bins
+    labs(title = "Comparison of Original and Sampled Distributions with 3 terms",
+         x = "Value",
+         y = "Frequency") +
+    scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    theme_minimal()
+
+# Plot with 100 bins for Distribution 3
+ggplot(data_to_plot3, aes(x = value, fill = type)) +
+    geom_histogram(position = "identity", alpha = 0.5, bins =50) +  # Increased number of bins
+    labs(title = "Comparison of Original and Sampled Distributions with 4 terms",
+         x = "Value",
+         y = "Frequency") +
+    scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    theme_minimal()
+
+# Plot with 100 bins for Distribution 4
+ggplot(data_to_plot4, aes(x = value, fill = type)) +
+    geom_histogram(position = "identity", alpha = 0.5, bins = 50) +  # Increased number of bins
+    labs(title = "Comparison of Original and Sampled Distributions with 5 terms",
+         x = "Value",
+         y = "Frequency") +
+    scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    theme_minimal()
+
+# Plot with 100 bins for Distribution 5
+ggplot(data_to_plot5, aes(x = value, fill = type)) +
+    geom_histogram(position = "identity", alpha = 0.5, bins = 50) +  # Increased number of bins
+    labs(title = "Comparison of Original and Sampled Distributions with 6 terms",
+         x = "Value",
+         y = "Frequency") +
+    scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    theme_minimal()
+
+# Plot with 100 bins for Distribution 6
+ggplot(data_to_plot6, aes(x = value, fill = type)) +
+    geom_histogram(position = "identity", alpha = 0.5, bins = 50) +  # Increased number of bins
+    labs(title = "Comparison of Original and Sampled Distributions with 7 terms",
+         x = "Value",
+         y = "Frequency") +
+    scale_fill_manual(values = c("Original" = "blue", "Sampled" = "red")) +
+    theme_minimal()
+```
+
+##Kolmogorov-Smirnov Test
+The Kolmogorov-Smirnov (KS) test results provide a comparison between the original example data (rainfall) and the data simulated from metalog distributions with increasing terms (from 2 to 9 terms). Each result includes a `D` statistic, which represents the maximum distance between the empirical cumulative distribution functions (CDFs) of the two datasets, and a p-value, which indicates the probability of observing a `D` statistic at least as extreme as the one observed under the null hypothesis that the distributions are the same.
+
+```{r}
+# Assuming sampled_data and original_data are available
+# For Kolmogorov-Smirnov Test
+ks_test_result_T2 <- ks.test(rainfall_data$random_sampled_rainfall, sampled_data1)
+ks_test_result_T3 <- ks.test(rainfall_data$random_sampled_rainfall, sampled_data2)
+ks_test_result_T4 <- ks.test(rainfall_data$random_sampled_rainfall, sampled_data3)
+ks_test_result_T5 <- ks.test(rainfall_data$random_sampled_rainfall, sampled_data4)
+ks_test_result_T6 <- ks.test(rainfall_data$random_sampled_rainfall, sampled_data5)
+ks_test_result_T7 <- ks.test(rainfall_data$random_sampled_rainfall, sampled_data6)
+ks_test_result_T8 <- ks.test(rainfall_data$random_sampled_rainfall, sampled_data7)
+ks_test_result_T9 <- ks.test(rainfall_data$random_sampled_rainfall, sampled_data8)
+# Print the result
+
+print(ks_test_result_T2)
+print(ks_test_result_T3)
+print(ks_test_result_T4)
+print(ks_test_result_T5)
+print(ks_test_result_T6)
+print(ks_test_result_T7)
+print(ks_test_result_T8)
+print(ks_test_result_T9)
+
+```
+
+
+### KS Test Results Interpretation
+
+- **Goodness of Fit Increases:** There is a trend where the goodness of fit improves as the number of terms in the metalog increases, particularly noticeable from term 6 onwards, where p-values become very high, suggesting excellent fits.
+- **Choosing a Model:** The results from T6 onwards show no significant statistical advantage in increasing the number of terms beyond 6 in terms of improving the goodness of fit, as evidenced by similar or oscillating p-values.
+- **Practical Considerations:** Although increasing the number of terms generally provides a more flexible model that can capture complex data structures more accurately, it's essential to balance this with the risk of overfitting and increased computational cost. Based on these results, a model with 6 to 7 terms seems optimal given the high p-values and the very low `D` statistics.
+
+
+## Chi-squared Test
+The Chi-squared tests reveal how well the metalog distributions, with varying numbers of terms, fit the observed data of rainfall distributions. The Chi-squared statistic (`X-squared`) and the p-values together provide a quantitative measure of the discrepancies between expected frequencies derived from the metalog distributions and observed frequencies from the data. A very high Chi-squared value and extremely low p-value indicate a poor fit.
+```{r}
+# Chi-squared Test Function
+calculate_chi_squared <- function(original_data, metalog_object, num_terms, num_bins = 100) {
+  # Define histogram breaks based on the original data
+  breaks <- seq(min(original_data), max(original_data), length.out = num_bins + 1)
+  
+  # Calculate observed counts for each bin
+  observed_counts <- hist(original_data, breaks = breaks, plot = FALSE)$counts
+
+  # Simulate data from the metalog distribution
+  set.seed(123)  # for reproducibility
+  simulated_data <- rmetalog(metalog_object, n = as.numeric(length(original_data)), term = num_terms)
+  
+  # Calculate expected counts based on the simulated data
+  expected_counts <- hist(simulated_data, breaks = breaks, plot = FALSE)$counts
+
+  # Ensure all expected counts are greater than zero for the chi-squared test validity
+  if (any(expected_counts == 0)) {
+    warning("Some expected counts are zero; consider using more data or fewer bins.")
+    return(NA)
+  }
+
+  # Perform Chi-squared test
+  chi_squared_test_result <- chisq.test(x = observed_counts, p = expected_counts / sum(expected_counts), simulate.p.value = TRUE)
+
+  # Return the test result
+  return(chi_squared_test_result)
+}
+
+set.seed(123)  # for reproducibility
+random_sampled_rainfall <- rainfall_dist$r(2000)
+
+# fit metalog distribution to different sampling methods
+metalog_fit <- metalog(x = random_sampled_rainfall, term_limit = 9, bounds = c(min(random_sampled_rainfall ), max(random_sampled_rainfall)), step_len = 0.01, boundedness = 'b')
+
+# Example usage:
+# Assuming 'original_data' is your dataset and 'metalog_fit' is your metalog model object
+chi_squared_T2 <- calculate_chi_squared(random_sampled_rainfall, metalog_fit, num_terms = 2, num_bins = 100)
+chi_squared_T3 <- calculate_chi_squared(random_sampled_rainfall, metalog_fit, num_terms = 3, num_bins = 100)
+chi_squared_T4 <- calculate_chi_squared(random_sampled_rainfall, metalog_fit, num_terms = 4, num_bins = 100)
+chi_squared_T5 <- calculate_chi_squared(random_sampled_rainfall, metalog_fit, num_terms = 5, num_bins = 100)
+chi_squared_T6 <- calculate_chi_squared(random_sampled_rainfall, metalog_fit, num_terms = 6, num_bins = 100)
+chi_squared_T7 <- calculate_chi_squared(random_sampled_rainfall, metalog_fit, num_terms = 7, num_bins = 100)
+chi_squared_T8 <- calculate_chi_squared(random_sampled_rainfall, metalog_fit, num_terms = 8, num_bins = 100)
+chi_squared_T9 <- calculate_chi_squared(random_sampled_rainfall, metalog_fit, num_terms = 9, num_bins = 100)
+
+# Print the result
+print(chi_squared_T2)
+print(chi_squared_T3)
+print(chi_squared_T4)
+print(chi_squared_T5)
+print(chi_squared_T6)
+print(chi_squared_T7)
+print(chi_squared_T8)
+print(chi_squared_T9)
+
+```
+
+
+### Interpretation of Chi-squared Test Results
+
+- **Trend Observation:** As the number of terms increases from 2 to 7, the Chi-squared statistics generally decrease and the p-values increase, indicating improved fit.
+- **Optimal Model Selection:** The 7-term model appears to provide the best balance between complexity and goodness of fit, as indicated by the Chi-squared statistic and the p-value.
+- **Further Considerations:** Although increasing terms generally improves fit, careful consideration should be given to model complexity and the potential for overfitting, especially when the improvements in fit become marginal (as seen from 7 to 9 terms).

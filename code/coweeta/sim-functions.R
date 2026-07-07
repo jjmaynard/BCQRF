@@ -788,13 +788,13 @@ simulate_soil_properties <- function(data, global_cor_matrices, global_cor_txt_m
   sim_data_columns <- intersect(sim_data_columns, colnames(data))
 
   # Subset and infill the data (assuming infill_soil_data() is defined elsewhere)
-  sim_data <- data %>%
-    dplyr::select(dplyr::all_of(sim_columns)) %>%
+  sim_data <- data |>
+    dplyr::select(dplyr::all_of(sim_columns)) |>
     infill_soil_data()
 
   # Create or recode the genetic horizon identifier ('genhz')
   if (!"genhz" %in% colnames(sim_data)) {
-    sim_data <- sim_data %>%
+    sim_data <- sim_data |>
       dplyr::mutate(genhz = sub("^[0-9]+", "", hzname))  # remove any leading digits
 
     sim_data$genhz <- generalizeHz(
@@ -833,20 +833,20 @@ simulate_soil_properties <- function(data, global_cor_matrices, global_cor_txt_m
   # --- Step 3: Calculate Local Correlation Matrices ---
 
   # Select simulation properties (columns ending with "_r") along with genhz.
-  rep_columns <- sim_data %>%
+  rep_columns <- sim_data |>
     dplyr::select(dplyr::ends_with("_r"), genhz)
 
   # Stop if there is not more than one soil property to simulate.
-  if(ncol(rep_columns %>% dplyr::select(dplyr::ends_with("_r"))) < 2) {
+  if(ncol(rep_columns |> dplyr::select(dplyr::ends_with("_r"))) < 2) {
     stop("More than one property is required for simulation")
   }
 
   # If all three soil texture columns exist, compute the ILR transformation.
   texture_cols <- c("sandtotal_r", "silttotal_r", "claytotal_r")
   if (all(texture_cols %in% colnames(sim_data))) {
-    ilr_site <- sim_data %>%
-      dplyr::select(dplyr::all_of(texture_cols)) %>%
-      ilr() %>%    # assumes ilr() is defined elsewhere
+    ilr_site <- sim_data |>
+      dplyr::select(dplyr::all_of(texture_cols)) |>
+      ilr() |>    # assumes ilr() is defined elsewhere
       as.matrix()
 
     # Add ILR components to the simulation data.
@@ -854,14 +854,14 @@ simulate_soil_properties <- function(data, global_cor_matrices, global_cor_txt_m
     rep_columns$ilr2 <- ilr_site[, 2]
 
     # Remove the original texture columns from rep_columns.
-    rep_columns <- rep_columns %>%
+    rep_columns <- rep_columns |>
       dplyr::select(-dplyr::all_of(texture_cols))
   }
 
   # Replace any zero values in the simulation columns (except excluded ones) with 0.01.
   exclude_cols <- c("hzdept_r", "hzdepb_r", "genhz")
   include_cols <- setdiff(names(rep_columns), exclude_cols)
-  rep_columns <- rep_columns %>%
+  rep_columns <- rep_columns |>
     dplyr::mutate(dplyr::across(dplyr::all_of(include_cols), ~ ifelse(. == 0, 0.01, .)))
 
   # Ensure 'genhz' is a factor.
@@ -881,10 +881,10 @@ simulate_soil_properties <- function(data, global_cor_matrices, global_cor_txt_m
 
   # Loop through each unique genetic horizon.
   for (gh in unique(rep_columns$genhz)) {
-    rep_columns_filtered <- rep_columns %>%
+    rep_columns_filtered <- rep_columns |>
       dplyr::filter(genhz == gh, wthirdbar_r != 0.01)
 
-    correlation_data <- rep_columns_filtered %>%
+    correlation_data <- rep_columns_filtered |>
       dplyr::select(dplyr::all_of(include_cols))
 
     # Calculate local correlation if enough observations exist;
@@ -918,7 +918,7 @@ simulate_soil_properties <- function(data, global_cor_matrices, global_cor_txt_m
   unique_cokeys <- unique(sim_data$cokey)
 
   for (ck in unique_cokeys) {
-    sim_subset <- sim_data %>% dplyr::filter(cokey == ck)
+    sim_subset <- sim_data |> dplyr::filter(cokey == ck)
 
     # The function simulate_cokey_generalized is assumed to be defined elsewhere.
     sim_result <- simulate_cokey_generalized(sim_subset, correlation_matrices, txt_correlation_matrices_local)
@@ -2055,9 +2055,9 @@ simulate_soil_profile_thickness <- function(horizon_data, n_simulations = 500) {
   all_results <- all_results[, c("Simulation", "Method", "hzname", "top", "bottom", "Thickness")]
 
   # Group results by horizon name and calculate the standard deviation of thickness for each horizon
-  horizon_sd <- all_results %>%
-    dplyr::group_by(hzname) %>%
-    dplyr::summarise(thickness_sd = round(sd(Thickness), 2)) %>%
+  horizon_sd <- all_results |>
+    dplyr::group_by(hzname) |>
+    dplyr::summarise(thickness_sd = round(sd(Thickness), 2)) |>
     dplyr::ungroup()
 
   # Merge the representative top and bottom depths from horizon_data
@@ -2068,7 +2068,7 @@ simulate_soil_profile_thickness <- function(horizon_data, n_simulations = 500) {
   )
 
   # Rename columns for consistency: hzdept_r -> top, hzdepb_r -> bottom
-  summarized_results <- summarized_results %>%
+  summarized_results <- summarized_results |>
     dplyr::rename(
       top = hzdept_r,
       bottom = hzdepb_r
@@ -2096,7 +2096,7 @@ simulate_soil_profile_thickness <- function(horizon_data, n_simulations = 500) {
 #' @export
 simulate_and_perturb_soil_profiles <- function(soil_profile) {
   # Step 1: Extract horizons from the soil profile and select relevant columns
-  soil_profile@horizons <- aqp::horizons(soil_profile) %>%
+  soil_profile@horizons <- aqp::horizons(soil_profile) |>
     dplyr::select(mukey, id, cokey, compname, hzname, sim_comppct,
                   hzdept_l, hzdept_r, hzdept_h, hzdepb_l, hzdepb_r, hzdepb_h, hzthk_l, sim_comppct)
 
@@ -2136,19 +2136,19 @@ simulate_and_perturb_soil_profiles <- function(soil_profile) {
 
   # Step 2: Query OSD distinctness and get bound_sd values
   distinctness_data <- query_osd_distinctness(horizon_data)
-  bound_lut <- distinctness_data %>%
-    dplyr::group_by(id, genhz) %>%
-    dplyr::summarise(bound_sd = mean(bound_sd, na.rm = TRUE)) %>%
+  bound_lut <- distinctness_data |>
+    dplyr::group_by(id, genhz) |>
+    dplyr::summarise(bound_sd = mean(bound_sd, na.rm = TRUE)) |>
     dplyr::ungroup()
 
   # Step 3: Merge the simulated thickness data and distinctness data
-  combined_data <- merge(simulated_thickness, bound_lut, by = "genhz") %>%
+  combined_data <- merge(simulated_thickness, bound_lut, by = "genhz") |>
     dplyr::arrange(top)
 
   # Step 4: Add thickness standard deviation and bound_sd to the soil profile horizons
-  horizon_data <- horizon_data %>%
-    dplyr::left_join(combined_data %>% dplyr::select(hzname, thickness_sd, bound_sd), by = "hzname")
-  soil_profile@horizons <- horizon_data %>%
+  horizon_data <- horizon_data |>
+    dplyr::left_join(combined_data |> dplyr::select(hzname, thickness_sd, bound_sd) |> dplyr::distinct(), by = "hzname")
+  soil_profile@horizons <- horizon_data |>
     dplyr::select(mukey, id, cokey, compname, hzname, sim_comppct, hzdept_r, hzdepb_r, thickness_sd, bound_sd)
 
   # Step 3: First perturbation (horizon thickness)
@@ -2175,7 +2175,7 @@ simulate_and_perturb_soil_profiles <- function(soil_profile) {
 
   # Step 5: Identify out-of-range horizons and adjust depths
   adjust_out_of_range_profiles <- function(simulated_profiles, horizon_data) {
-    sim_horizons <- aqp::horizons(simulated_profiles) %>%
+    sim_horizons <- aqp::horizons(simulated_profiles) |>
       dplyr::select(id, mukey, cokey, compname, hzname, top = hzdept_r, bottom = hzdepb_r)
 
     merged_data <- merge(
@@ -2185,16 +2185,16 @@ simulate_and_perturb_soil_profiles <- function(soil_profile) {
       all.x = TRUE
     )
 
-    merged_data <- merged_data %>%
-      dplyr::rowwise() %>%
+    merged_data <- merged_data |>
+      dplyr::rowwise() |>
       dplyr::mutate(
         top = dplyr::if_else(is.na(hzdept_l), top, pmax(top, hzdept_l)),
         bottom = dplyr::if_else(is.na(hzdepb_h), bottom, pmin(bottom, hzdepb_h))
-      ) %>%
+      ) |>
       dplyr::ungroup()
 
-    simulated_profiles_hzdata <- aqp::horizons(simulated_profiles) %>%
-      dplyr::left_join(merged_data %>% dplyr::select(hzname, id, top, bottom), by = c("id", "hzname"))
+    simulated_profiles_hzdata <- aqp::horizons(simulated_profiles) |>
+      dplyr::left_join(merged_data |> dplyr::select(hzname, id, top, bottom), by = c("id", "hzname"))
     simulated_profiles@horizons <- simulated_profiles_hzdata
 
     return(simulated_profiles)
@@ -2409,7 +2409,7 @@ simulate_profile_depths_by_mukey <- function(mukey, n_simulations = 100, seed = 
 #' @export
 evaluate_simulated_depths <- function(simulated_profiles, horizon_data) {
   # Extract horizons from the simulated profiles
-  sim_horizons <- aqp::horizons(simulated_profiles) %>%
+  sim_horizons <- aqp::horizons(simulated_profiles) |>
     dplyr::select(mukey, cokey, compname, hzname, top = hzdept_r, bottom = hzdepb_r)
 
   # Merge simulated horizons with original horizon data for comparison
@@ -2433,12 +2433,12 @@ evaluate_simulated_depths <- function(simulated_profiles, horizon_data) {
 #' aws_mukey_quant <- function(sim_aws_df) {
 #'   #' Need to wrap in function in form that can be applied to each mukey.
 #'   #' @return A list with available water storage prediction interval (5,50,5,PIW90) for mukey.
-#'   aws_grouped <- sim_aws_df %>% group_by(top)
+#'   aws_grouped <- sim_aws_df |> group_by(top)
 #'   data_len_depth <- summarise(aws_grouped, depth_len = n())
 #'   sim_aws_df <- left_join(sim_aws_df, data_len_depth, by = "top")
 #'
 #'   # Step 1b: Reshape aws data by mukey
-#'   aws_grouped_bottom <- sim_aws_df %>% group_by(bottom)
+#'   aws_grouped_bottom <- sim_aws_df |> group_by(bottom)
 #'   aws_quant_list <- summarise(aws_grouped_bottom, aws_quant = quantile(sim_aws_df, probs = c(0.05, 0.50, 0.95)))
 #'
 #'   # Step 1c: Rename and group data

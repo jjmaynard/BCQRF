@@ -10,8 +10,9 @@ library(soilDB)
 library(soiltexture)
 library(aqp)
 library(here)
-#source(here("code/local_functions.R"))
 
+#source(here("code/local_functions.R"))
+source(here("code/coweeta/sim-functions.R"))
 # Define lookup table for general soil properties and their corresponding SoilGrids, SOLUS, and SSURGO labels
 lookup_table <- data.frame(
   Property = c(
@@ -33,6 +34,82 @@ lookup_table <- data.frame(
     "dbthirdbar_h", "cec7_h", "chf.fragvol_h AS rfv_h", "claytotal_h", "ph1to1h2o_h", "sandtotal_h", "silttotal_h", "om_h"
   )
 )
+
+```
+
+```{r}
+download_ssurgo_tabular <- function(aoi_wkt, properties= c("db", "cec", "rfv", "clay", "ph", "sand", "silt", "soc")){
+  # Define lookup table for general soil properties and their corresponding SoilGrids, SOLUS, and SSURGO labels
+  ssurgo_lookup <- data.frame(
+    Property = c("db", "cec", "rfv", "clay", "ph", "sand", "silt", "soc"),
+    # SoilGrids_Label = c("bdod", "cec", "cfvo", "clay", "phh2o", "sand", "silt", "soc"),
+    # SOLUS_Label = c("dbovendry", "cec7", "fragvol", "claytotal", "ph1to1h2o", "sandtotal", "silttotal", "soc"),
+    SSURGO_Label_Low = c("dbovendry_l", "cec7_l", "chf.fragvol_l AS rfv_l", "claytotal_l", "ph1to1h2o_l", "sandtotal_l", "silttotal_l", "om_l"),
+    SSURGO_Label_Rep = c("dbovendry_r", "cec7_r", "chf.fragvol_r AS rfv_r", "claytotal_r", "ph1to1h2o_r", "sandtotal_r", "silttotal_r", "om_r"),
+    SSURGO_Label_High = c("dbovendry_h", "cec7_h", "chf.fragvol_h AS rfv_h", "claytotal_h", "ph1to1h2o_h", "sandtotal_h", "silttotal_h", "om_h"),
+    stringsAsFactors = FALSE
+  )
+  
+  # Soil property lookup selection based on requested properties
+  props <- ssurgo_lookup[ssurgo_lookup$Property %in% properties, ]
+  
+  # Convert AOI WKT to spatial object and reproject to EPSG:5070 using terra functions
+  aoi <- terra::vect(aoi_wkt, crs = "epsg:4326")
+  aoi <- terra::project(aoi, "epsg:5070")
+  aoi <- terra::as.polygons(terra::ext(aoi), crs = "epsg:5070")
+  
+  ## Fetch SSURGO data
+  mu <- soilDB::mukey.wcs(aoi = aoi, db = "gssurgo")
+  mukey_list <- terra::values(mu) |> unique() 
+  
+  # Format mukey(s) and property(s) for SQL
+  formatted_mukey <- paste0("(", paste0("'", as.integer(mukey_list), "'", collapse = ","), ")")
+  ssurgo_variables <- c(props$SSURGO_Label_Low, props$SSURGO_Label_Rep, props$SSURGO_Label_High)
+  formatted_properties <- paste(na.omit(ssurgo_variables), collapse = ", ")
+  
+  # Construct the SQL query
+  query <- sprintf(
+    "
+    SELECT
+      -- contextual data
+      co.mukey, co.cokey, compname, comppct_l, comppct_r, comppct_h,
+      -- horizon morphology
+      ch.chkey, hzname, hzdept_l, hzdept_r, hzdept_h, hzdepb_l, hzdepb_r, hzdepb_h, hzthk_l, hzthk_r, hzthk_h,
+      -- soil property parameters
+      %s
+    FROM mapunit AS mu
+      INNER JOIN component AS co ON mu.mukey = co.mukey
+      INNER JOIN chorizon AS ch ON co.cokey = ch.cokey
+      LEFT JOIN chfrags AS chf ON ch.chkey = chf.chkey
+    WHERE mu.mukey IN %s
+    ORDER BY co.cokey, ch.hzdept_r ASC;",
+    formatted_properties, formatted_mukey
+  )
+  
+  query <- 'SELECT comp.mukey, comp.cokey, ch.chkey, ch.hzname, ch.hzdept_r, ch.hzdepb_r, ch.sandtotal_r, ch.silttotal_r, ch.claytotal_r, ch.pi_r, ch.lep_r, ch.ec_r, ch.caco3_r, ch.om_r, ch.dbovendry_r, ch.gypsum_r, ch.sar_r, ch.cec7_r, ch.ecec_r, ch.sumbases_r, ch.ph1to1h2o_r, frag.total_fragvol_r, cons.plasticity, cons.stickiness, comp.drainagecl, comp.hydricrating, comp.taxtempcl, comp.frostact, corestr.reskind, corestr.resdept_r AS comp_resdept_r, corestr.reshard, cotax.taxminalogy AS comp_taxminalogy, cm.pondfreqcl, cm.ponddurcl, cm.flodfreqcl, cm.floddurcl, muagg.wtdepannmin FROM CHORIZON ch LEFT JOIN COMPONENT comp ON ch.cokey = comp.cokey LEFT JOIN ( SELECT chkey, SUM(f.fragvol_r) AS total_fragvol_r FROM CHFRAGS f GROUP BY chkey ) AS frag ON ch.chkey = frag.chkey LEFT JOIN CHCONSISTENCE cons ON ch.chkey = cons.chkey LEFT JOIN CORESTRICTIONS corestr ON comp.cokey = corestr.cokey  LEFT JOIN COTAXFMMIN cotax ON comp.cokey = cotax.cokey LEFT JOIN ( SELECT cokey, MAX(monthseq) AS max_month, MAX(pondfreqcl) AS pondfreqcl, MAX(ponddurcl) AS ponddurcl, MAX(flodfreqcl) AS flodfreqcl, MAX(floddurcl) AS floddurcl FROM COMONTH GROUP BY cokey ) AS cm ON comp.cokey = cm.cokey LEFT JOIN MUAGGATT muagg ON comp.mukey = muagg.mukey WHERE comp.mukey IN (2738640,2738668,2738727,1698890,2738708,1698879,1698901,1698880,1698908,1698927,1698909,1698907,1698910,1698928,1698925,1698926,1698897,1698875,1698903,1698929,1698869,1698899,1698891,1698892,1698888,1698887,1698868,2837772,2837878,1698904,1698871,1698874,1698920,1698917,1698906,1698919,1698882,1698872,1698873,1698881,1698893,1698894,2837877,1698916,1698886,1698915,1698885,1698900,1698912) ORDER BY comp.mukey, comp.cokey, ch.hzdept_r;'
+  # Submit the query and fetch results using soilDB
+  ssurgo_data <- soilDB::SDA_query(query)
+  
+  if ("rfv" %in% ssurgo_variables) {
+    # Group by `chkey` and sum rock fragment values (rfv_l, rfv_r, rfv_h) using dplyr
+    rfv_sum <- ssurgo_data |>
+      dplyr::group_by(chkey) |>
+      dplyr::summarise(
+        rfv_l = sum(rfv_l, na.rm = TRUE),
+        rfv_r = sum(rfv_r, na.rm = TRUE),
+        rfv_h = sum(rfv_h, na.rm = TRUE)
+      ) |>
+      dplyr::ungroup()
+    
+    # Merge the summed values back to the main dataset and remove duplicates
+    ssurgo_data <- ssurgo_data |>
+      dplyr::select(-dplyr::all_of(c("rfv_l", "rfv_r", "rfv_h"))) |>
+      dplyr::left_join(rfv_sum, by = "chkey") |>
+      dplyr::distinct()
+  }
+  return(ssurgo_data)
+}  
+  
 
 ```
 
@@ -76,7 +153,7 @@ download_soil_data_sources <- function(aoi_wkt, properties) {
   lookup_table <- data.frame(
     Property = c("db", "cec", "rfv", "clay", "ph", "sand", "silt", "soc"),
     SoilGrids_Label = c("bdod", "cec", "cfvo", "clay", "phh2o", "sand", "silt", "soc"),
-    SOLUS_Label = c("dbovendry", "cec7", "fragvol", "claytotal", "ph1to1h2o", "sandtotal", "silttotal", "soc", "resdept"),
+    SOLUS_Label = c("dbovendry", "cec7", "fragvol", "claytotal", "ph1to1h2o", "sandtotal", "silttotal", "soc"),
     SSURGO_Label_Low = c("dbovendry_l", "cec7_l", "chf.fragvol_l AS rfv_l", "claytotal_l", "ph1to1h2o_l", "sandtotal_l", "silttotal_l", "om_l"),
     SSURGO_Label_Rep = c("dbovendry_r", "cec7_r", "chf.fragvol_r AS rfv_r", "claytotal_r", "ph1to1h2o_r", "sandtotal_r", "silttotal_r", "om_r"),
     SSURGO_Label_High = c("dbovendry_h", "cec7_h", "chf.fragvol_h AS rfv_h", "claytotal_h", "ph1to1h2o_h", "sandtotal_h", "silttotal_h", "om_h"),
@@ -91,9 +168,9 @@ download_soil_data_sources <- function(aoi_wkt, properties) {
   aoi <- terra::project(aoi, "epsg:5070")
   aoi <- terra::as.polygons(terra::ext(aoi), crs = "epsg:5070")
   
-  # -------------------------------------------------------------------------------------------------------------------------------
+  # -------------------------------------------------------------------------------------------------------------------------
   # SSURGO Processing
-  # -------------------------------------------------------------------------------------------------------------------------------
+  # -------------------------------------------------------------------------------------------------------------------------
   
   ## Fetch SSURGO data
   mu <- soilDB::mukey.wcs(aoi = aoi, db = "gssurgo")
@@ -134,32 +211,32 @@ download_soil_data_sources <- function(aoi_wkt, properties) {
   
   if ("CoarseFrag" %in% ssurgo_variables) {
     # Group by `chkey` and sum rock fragment values (rfv_l, rfv_r, rfv_h) using dplyr
-    rfv_sum <- ssurgo_data %>%
-      dplyr::group_by(chkey) %>%
+    rfv_sum <- ssurgo_data |>
+      dplyr::group_by(chkey) |>
       dplyr::summarise(
         rfv_l = sum(rfv_l, na.rm = TRUE),
         rfv_r = sum(rfv_r, na.rm = TRUE),
         rfv_h = sum(rfv_h, na.rm = TRUE)
-      ) %>%
+      ) |>
       dplyr::ungroup()
     
     # Merge the summed values back to the main dataset and remove duplicates
-    ssurgo_data <- ssurgo_data %>%
-      dplyr::select(-dplyr::all_of(c("rfv_l", "rfv_r", "rfv_h"))) %>%
-      dplyr::left_join(rfv_sum, by = "chkey") %>%
+    ssurgo_data <- ssurgo_data |>
+      dplyr::select(-dplyr::all_of(c("rfv_l", "rfv_r", "rfv_h"))) |>
+      dplyr::left_join(rfv_sum, by = "chkey") |>
       dplyr::distinct()
   }
   
   #mukey-wise calcualtion of simulated comppct
-  ssurgo_comppct_sim <- ssurgo_data %>%
-    group_by(mukey) %>%
-    do({
+  ssurgo_comppct_sim <- ssurgo_data |>
+    dplyr::group_by(mukey) |>
+    dplyr::do({
       # Apply sim_component_comp to each group (subset) of rows
-      sim_component_comp(., n_simulations = 1000)
-    }) %>% ungroup()
+      sim_component_comp(., n_simulations = 100)
+    }) |> dplyr::ungroup()
   
   
-  ssurgo_data <- ssurgo_data %>% left_join(ssurgo_comppct_sim %>% dplyr::select(cokey, sim_comppct), by="cokey")
+  ssurgo_data <- ssurgo_data |> dplyr::left_join(ssurgo_comppct_sim |> dplyr::select(cokey, sim_comppct), by="cokey")
   
   # Remove organic layers if present
   if (any(grepl("O", ssurgo_data$hzname))) {
@@ -167,7 +244,7 @@ download_soil_data_sources <- function(aoi_wkt, properties) {
   }
   
   # Create a Soil Profile Collection
-  ssurgo_data <- ssurgo_data %>% as.data.frame()
+  ssurgo_data <- ssurgo_data |> as.data.frame() |> dplyr::mutate(id = cokey)
   depths(ssurgo_data) <- id ~ hzdept_r + hzdepb_r
   hzdesgnname(ssurgo_data) <- "hzname"
   res <- checkHzDepthLogic(ssurgo_data)
@@ -184,9 +261,9 @@ download_soil_data_sources <- function(aoi_wkt, properties) {
   levels(ssurgo) <- rat
   ssurgo <- aqp::catalyze(ssurgo)
   
-  # -------------------------------------------------------------------------------------------------------------------------------
+  # -------------------------------------------------------------------------------------------------------------------------
   # SOLUS Processing
-  # -------------------------------------------------------------------------------------------------------------------------------
+  # -------------------------------------------------------------------------------------------------------------------------
   
   ## Fetch SOLUS data
   solus <- soilDB::fetchSOLUS(
@@ -227,8 +304,8 @@ download_soil_data_sources <- function(aoi_wkt, properties) {
 
 # Example usage:
 aoi_wkt <- 'POLYGON((-101.7703 41.1811,-101.7703 41.3042,-101.4972 41.3042,-101.4972 41.1811,-101.7703 41.1811))'
-properties = "Clay"
-soil_data <- download_soil_data(aoi_wkt, properties)
+properties = "clay"
+soil_data <- download_soil_data_sources(aoi_wkt, properties)
 ```
 
 

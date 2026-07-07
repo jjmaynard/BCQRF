@@ -1,4 +1,41 @@
-
+# ----------------------------------------------------------------------------------------------------
+#' 1.  `get_aws_data_by_mukey`
+#'     Queries SSURGO soil database for soil properties used to calculate AWS based on specified map unit keys (mukey).
+#'
+#' 2.  `query_osd_distinctness`
+#'     Retrieves and converts horizon distinctness codes to offset values from Official Series Descriptions (OSD).
+#'
+#' 3.  `infill_missing_distinctness`
+#'     Assigns default horizon boundary distinctness values when missing based on common horizon types.
+#'
+#' 4. `tri_dist`
+#'     Generates random samples from a triangular distribution given minimum, maximum, and mode values.
+#'
+#' 5.  `infill_missing_depth_variability`
+#'     Fills missing top and bottom depth values in soil horizons using representative values ± 2 cm.
+#'
+#' 6. `simulate_soil_profile_top_down`
+#'     Simulates soil profile depths starting from the surface and moving downward through horizons.
+#'
+#' 7.  `simulate_soil_profile_bottom_up`
+#'     Simulates soil profile depths starting from the bottom horizon and moving upwards.
+#'
+#' 8. `simulate_soil_profile_thickness`
+#'     Computes soil profile thickness variability using top-down and bottom-up simulation approaches.
+#'
+#' 9.  `simulate_and_perturb_soil_profiles`
+#'     Simulates soil profile thickness and perturbs horizon boundaries to account for variability.
+#'
+#' 10.  `simulate_profile_depths_by_mukey`
+#'     Retrieves SSURGO data and simulates soil profile depths for a given map unit key (mukey).
+#'
+#' 11.  `simulate_profile_depths_by_collection`
+#'     Simulates soil profile depths for an entire SoilProfileCollection using multiple perturbations.
+#'
+#' 12.  `evaluate_simulated_depths`
+#'     Evaluates if simulated soil profile depths fall outside specified depth ranges.
+#'
+# ----------------------------------------------------------------------------------------------------
 
 # Define the function
 get_aws_data_by_mukey <- function(mukeys) {

@@ -68,7 +68,7 @@ ssurgo_data <- ssurgo_data %>%
     rfv_h = fraggt10_h + frag3to10_h   # Total high estimate
   )
 
-ssurgo_data <- ssurgo_data %>%dplyr::select(id, mukey, cokey, compname, comppct_l, comppct_r, comppct_h, chkey, hzname, hzdept_l, hzdept_r, hzdept_h, hzdepb_l, hzdepb_r, hzdepb_h, hzthk_l, hzthk_r, hzthk_h, sandtotal_l, sandtotal_r, sandtotal_h, silttotal_l, silttotal_r, silttotal_h, claytotal_l, claytotal_r, claytotal_h, dbovendry_l, dbovendry_r, dbovendry_h, wthirdbar_l, wthirdbar_r, wthirdbar_h, wfifteenbar_l, wfifteenbar_r, wfifteenbar_h, rfv_l, rfv_r, rfv_h)
+ssurgo_data <- ssurgo_data %>% dplyr::select(id, mukey, cokey, compname, comppct_l, comppct_r, comppct_h, chkey, hzname, hzdept_l, hzdept_r, hzdept_h, hzdepb_l, hzdepb_r, hzdepb_h, hzthk_l, hzthk_r, hzthk_h, sandtotal_l, sandtotal_r, sandtotal_h, silttotal_l, silttotal_r, silttotal_h, claytotal_l, claytotal_r, claytotal_h, dbovendry_l, dbovendry_r, dbovendry_h, wthirdbar_l, wthirdbar_r, wthirdbar_h, wfifteenbar_l, wfifteenbar_r, wfifteenbar_h, rfv_l, rfv_r, rfv_h)
 
 ```
 

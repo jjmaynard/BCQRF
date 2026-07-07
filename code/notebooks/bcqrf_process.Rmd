@@ -11,8 +11,11 @@ library(soiltexture)
 library(aqp)
 library(here)
 
-#source(here("code/local_functions.R"))
-source(here("code/coweeta/sim-functions.R"))
+# sim-functions.R was split into code/R/depth_simulation.R and
+# code/R/property_simulation.R during the code/ reorganization.
+source(here("code/R/depth_simulation.R"))
+source(here("code/R/property_simulation.R"))
+source(here("code/R/soil_infill_functions.R"))
 # Define lookup table for general soil properties and their corresponding SoilGrids, SOLUS, and SSURGO labels
 lookup_table <- data.frame(
   Property = c(

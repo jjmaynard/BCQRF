@@ -1,17 +1,16 @@
 Package: BCQRF
-Title: What the Package Does (One Line, Title Case)
+Title: Bayesian Constrained Quantile Regression Forest for Soil Property Prediction
 Version: 0.0.0.9000
 Authors@R:
-    person("First", "Last", , "first.last@example.com", role = c("aut", "cre"))
-Description: What the package does (one paragraph).
+    person("J.J.", "Maynard", role = c("aut", "cre"))
+Description: A soil-science research project that predicts soil properties
+    (e.g. clay content) by combining SSURGO, SOLUS, SoilGrids, and KSSL data
+    sources with Monte Carlo simulation of correlated soil properties and
+    Bayesian updating to constrain quantile regression forest predictions.
+    Includes a Coweeta Hydrologic Laboratory watershed case study. This is
+    not built or distributed as an installable R package; DESCRIPTION is kept
+    as an informal project manifest.
 License: MIT + file LICENSE
-ByteCompile: true
 Encoding: UTF-8
-LazyData: true
-Roxygen: list(markdown = TRUE)
-RoxygenNote: 7.3.1
 URL: https://github.com/jjmaynard/BCQRF
 BugReports: https://github.com/jjmaynard/BCQRF/issues
-Imports: here
-Suggests: devtools,
-    git2r

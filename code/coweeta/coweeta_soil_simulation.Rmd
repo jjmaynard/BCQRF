@@ -474,8 +474,10 @@ rgl::rgl.close()
 
 # iterate over results and generate VG model curve
 VG_sim <- lapply(1:nrow(mukey_sim), function(i) {
-  
+
   # model bounds are given in kPA of suction
+  # BROKEN: KSSL_VG_model() is not defined anywhere in this repo (undeclared
+  # external dependency). Flagged, not fixed, during the code/ reorganization.
   vg <- KSSL_VG_model(VG_params = mukey_sim[i, ], phi_min = 10^-3, phi_max=10^6)
   
   # extract curve and add texture ID
@@ -544,8 +546,10 @@ xyplot(phi ~ `0.5` | compname, data = VG_sim_df_top_quant,
 # generate VG model curve
 # compute a simplistic AWC
 awc <- lapply(1:nrow(mukey_sim), function(i) {
-  
+
   # model bounds are given in kPA of suction
+  # BROKEN: KSSL_VG_model() is not defined anywhere in this repo (undeclared
+  # external dependency). Flagged, not fixed, during the code/ reorganization.
   vg <- KSSL_VG_model(VG_params = mukey_sim[i, ], phi_min = 10^-3, phi_max=10^6)
   
   # extract VWC at specific matric potentials (kPa)

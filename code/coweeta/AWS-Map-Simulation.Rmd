@@ -31,7 +31,12 @@ library(furrr)
 library(future)
 
 # Load local functions
-source(here('code/sim-functions.R'))
+# NOTE: sim-functions.R was split into code/R/depth_simulation.R and
+# code/R/property_simulation.R during the code/ reorganization; the old path
+# (code/sim-functions.R, which never resolved even before the split) is fixed here.
+source(here('code/R/depth_simulation.R'))
+source(here('code/R/property_simulation.R'))
+source(here('code/R/soil_infill_functions.R'))
 ```
 
 
@@ -166,6 +171,11 @@ final_processed_data <- adjust_soil_data(ssurgo_soil_sim_df, properties)
 
 
 
+# BROKEN: from here down, this chunk references simulated_clay, n_depths, and
+# n_simulations, none of which are defined anywhere in this file - they were
+# copy-pasted from code/coweeta/depthwise-multivariate-profile-simulation.Rmd
+# without their setup code and will not run standalone. Flagged, not fixed,
+# during the code/ reorganization.
 # Reshape clay data into a matrix where each row is a depth and each column is a simulation
 simulated_clay_matrix <- matrix(simulated_clay, nrow = n_depths, ncol = n_simulations, byrow = TRUE)
 

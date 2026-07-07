@@ -3,7 +3,7 @@ library(dplyr)
 library(here)
 library(yaml)
 
-tar_source()
+tar_source("code/R")
 
 # Set global options if needed, e.g.,
 tar_option_set(packages = c("here", "dplyr", "magrittr"))
